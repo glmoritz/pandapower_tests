@@ -52,5 +52,5 @@ with open(output_filename, mode='w', newline='', encoding='utf-8') as outfile:
     writer = csv.writer(outfile, delimiter=',')
     for timestamp in sorted(accumulator.keys()):
         # Format floats with 2 decimal digits, using comma as decimal separator
-        formatted_values = [f'{v:.2f}'.replace('.', '.') for v in accumulator[timestamp]]
+        formatted_values = [f'{-1*v:.2f}'.replace('.', '.') for v in accumulator[timestamp]]
         writer.writerow([timestamp] + formatted_values)

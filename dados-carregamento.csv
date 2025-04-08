@@ -1,4 +1,4 @@
-25Ano;Mes;Dia;Inicio;Termino;Carregador;Corrente (A);Potencia (kW);Consumo (kWh);Pico?
+Ano;Mes;Dia;Inicio;Termino;Carregador;Corrente (A);Potencia (kW);Consumo (kWh);Pico?
 2024;Dezembro;01/12/2024;00:00:01;05:23:07;[25];12,95;2,84;13,50;NÆo
 2024;Dezembro;01/12/2024;09:06:06;11:22:11;[25];14,91;3,30;5,89;NÆo
 2024;Dezembro;01/12/2024;17:39:11;17:59:11;[20];13,53;2,99;0,73;NÆo
