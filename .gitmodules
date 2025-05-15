@@ -1,0 +1,3 @@
+[submodule "mosaik-pandapower-2"]
+	path = local-mosaik-pandapower-2
+	url = https://github.com/glmoritz/mosaik-pandapower-2.git
