@@ -19,8 +19,10 @@
 
 	"runArgs": [
         // Use the network stack of the host machine
-        "--net=host"
+        "--net=host",
+		"-v", "sigivest_simulation_results:/results"
     ]
+
 
 	// Features to add to the dev container. More info: https://containers.dev/features.
 	// "features": {},

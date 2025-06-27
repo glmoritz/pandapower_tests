@@ -101,8 +101,7 @@ class SolarIrradiationModel(mosaik_api.Simulator):
         
         results = {}
 
-        for eid, entity in self.entities.items():
-            print(f"[{self.sid}] Step at t={time}")
+        for eid, entity in self.entities.items():            
             last_step = self.results[eid]['time_elapsed'] if (eid in self.results and 'time_elapsed' in self.results[eid]) else 0
             current_step_size = time - last_step
 

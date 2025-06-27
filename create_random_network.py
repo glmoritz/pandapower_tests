@@ -18,7 +18,7 @@ class NetworkType(Enum):
 def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,                            
                             ForkLengthRange, LineBusesRange, LineForksRange,
                             mv_bus_coordinates=(0.0, 0.0),
-                            ):
+                            ):    
     net_cigre_lv = pp.create_empty_network()
 
     # Linedata
@@ -86,10 +86,10 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
 
         # Add transformer from MV to LV
         create_cigre_lv_transformer(parent_bus, working_bus, f"{str(transformer_type)}_{branch_index}_Trafo", transformer_type)
-        network_vertices = [
+        network_edges = [
                     {
-                        'edges': (parent_bus,working_bus),
-                        'length': 15.0
+                        'vertices': (parent_bus,working_bus),
+                        'length': 100.0
                     }
                     ]
                 
@@ -134,9 +134,9 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
 
                 #create a line connecting the parent bus to the child bus
                 pp.create_line(current_net, working_bus, new_bus, length_km=fork_hop_lengths[f][b], std_type='OH1', name=f'Line {net_cigre_lv.bus.at[working_bus, 'name']}-{net_cigre_lv.bus.at[new_bus, 'name']}')
-                network_vertices.append(
+                network_edges.append(
                     {
-                        'edges': (working_bus, new_bus),
+                        'vertices': (working_bus, new_bus),
                         'length': fork_hop_lengths[f][b]
                     }
                 )
@@ -154,7 +154,7 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
             # Retrieve the parent_bus_name from net_cigre_lv
             working_bus_name = net_cigre_lv.bus.at[parent_bus, 'name']
         
-        return network_vertices
+        return network_edges
 
     # Create transformers by type
     Ct = random.randint(*CommercialRange)
@@ -191,7 +191,7 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
     success, points = generate_network_coordinates(
         net=net_cigre_lv,
         root_bus_index=mv_bus,        
-        network_vertices=total_net_lines,
+        network_edges=total_net_lines,
         min_distance_m=5,  # Minimum distance between points
         max_attempts=50  # Maximum attempts to place a point
     )
@@ -223,37 +223,382 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
     return net_cigre_lv, total_net_lines
 
 
-def generate_network_coordinates(net, root_bus_index, network_vertices, min_distance_m=10, max_attempts=50):
+def arc_span(arc):
+    """Calculate the angle span of an arc."""
+    start, stop = normalize_arc(*arc)
+    return (stop - start) % (2 * math.pi)
+
+
+def normalize_arc(start, stop):
+    """Normalize arc so that start in [0, 2π), and stop >= start."""
+    start %= (2*math.pi)
+    stop  %= (2*math.pi)
+    if stop <= start:
+        stop += (2*math.pi)
+    return start, stop
+
+def complement_arc(arc):
+    """
+    Returns the complement of an arc on the unit circle as a list of 0, 1, or 2 arcs (in radians).
+    The complement is the set of points not included in the input arc.
+    """
+    start, stop = normalize_arc(*arc)
+    if (stop - start) % (2 * math.pi) == 0:
+        # Full circle, complement is empty
+        return []
+    elif stop > start:
+        return [normalize_arc(stop % (2 * math.pi), start % (2 * math.pi))]
+    else:
+        # Should not happen due to normalize_arc, but handle for safety
+        return [normalize_arc(stop, start)]
+
+def angle_in_arc(angle, arc):
+    """Check if angle is within arc (start, stop) on the unit circle.
+
+    Arc is defined with start <= stop (stop may be > 2π if wrapping occurs).
+    The check is inclusive of start, exclusive of stop: [start, stop).
+    """
+    start, stop = normalize_arc(*arc)
+    angle = angle % (2 * math.pi)
+    angle = angle if angle >= start else angle + 2 * math.pi
+    return start <= angle < stop
+
+def add_arc(arcs, new_arc):
+    """
+    Adds a new arc to a list of arcs, merging overlapping or adjacent arcs.
+    All arcs are tuples (start, stop) in radians.
+    Returns a new list of arcs.
+    """
+    if not arcs:
+        return [normalize_arc(*new_arc)]
+    new_arc = normalize_arc(*new_arc)
+    result = []
+    added = False
+    for arc in arcs:
+        arc = normalize_arc(*arc)
+        # Check if arcs overlap or touch
+        if (angle_in_arc(new_arc[0], arc) or angle_in_arc(new_arc[1] - 1e-12, arc) or
+            angle_in_arc(arc[0], new_arc) or angle_in_arc(arc[1] - 1e-12, new_arc)):
+            # Merge arcs
+            merged = union_arcs(arc, new_arc)
+            # If merged into one arc, continue merging with others
+            if len(merged) == 1:
+                new_arc = merged[0]
+                added = True
+            else:
+                # If not merged, keep both
+                result.extend(merged)
+                added = True
+        else:
+            result.append(arc)
+    if not added:
+        result.append(new_arc)
+    # After possible merges, sort and merge again if needed
+    result = sorted([normalize_arc(*a) for a in result], key=lambda x: x[0])
+    merged_result = []
+    for arc in result:
+        if not merged_result:
+            merged_result.append(arc)
+        else:
+            last = merged_result[-1]
+            # Try to merge with last
+            merged = union_arcs(last, arc)
+            if len(merged) == 1:
+                merged_result[-1] = merged[0]
+            else:
+                merged_result.append(arc)
+    return [normalize_arc(*arc) for arc in merged_result if arc_span(arc) > 1e-12]
+
+def subtract_arc(arc_a, arc_b):
+    """
+    Subtract arc_b from arc_a on the unit circle.
+    Returns a list of 0, 1, or 2 arcs (in radians) representing the result.
+    """
+    a_start, a_stop = normalize_arc(*arc_a)
+    b_start, b_stop = normalize_arc(*arc_b)
+
+    # Normalize arcs to [0, 2π)
+    a_span = (a_start, a_stop)
+    b_span = (b_start, b_stop)
+
+    # If arc_b fully covers arc_a, result is empty
+    if angle_in_arc(a_start, b_span) and angle_in_arc(a_stop - 1e-12, b_span):
+        return []
+
+    # If arc_b does not overlap arc_a, return arc_a
+    if intersect_arcs(a_span, b_span) == []:
+        return [normalize_arc(*a_span)]
+
+    result = []
+    # If b_start is inside a, add [a_start, b_start]
+    if angle_in_arc(b_start, a_span) and not math.isclose(a_start, b_start):
+        result.append((a_start, b_start))
+    # If b_stop is inside a, add [b_stop, a_stop]
+    if angle_in_arc(b_stop, a_span) and not math.isclose(a_stop, b_stop):
+        result.append((b_stop, a_stop))
+    return [normalize_arc(*arc) for arc in result if arc_span(arc) > 1e-12]
+
+def union_arcs(a, b):
+    """Return the union of two arcs as a list of 1 or 2 arcs (in radians)."""
+    a_start, a_stop = normalize_arc(*a)
+    b_start, b_stop = normalize_arc(*b)
+    
+    # Sort arcs by start angle
+    arcs = sorted([(a_start, a_stop), (b_start, b_stop)])
+
+    # Merge if overlapping or touching
+    if arcs[0][1] >= arcs[1][0]:
+        merged = (arcs[0][0], max(arcs[0][1], arcs[1][1]))
+        return [normalize_arc(merged[0] , merged[1])]
+    else:
+        return [normalize_arc(arcs[0][0], arcs[0][1]), normalize_arc(arcs[1][0], arcs[1][1])]
+
+def intersect_arcs(a, b):
+    """Return the intersection of two arcs as a list of 0 or 1 arcs (in radians)."""
+    a_start, a_stop = normalize_arc(*a)
+    b_start, b_stop = normalize_arc(*b)
+
+    # Unroll arcs into [a_start, a_stop) and [b_start, b_stop)
+    start = max(a_start, b_start)
+    stop  = min(a_stop, b_stop)
+
+    if start < stop:
+        #return [(start % (2*math.pi), stop % (2*math.pi))]
+        return [normalize_arc(start, stop)]
+    else:
+        return []  # no overlap
+
+def compute_nonoverlapping_subarcs(parent1, parent2, points_info):
+#def compute_nonoverlapping_subarcs(theta3, theta1, theta2, theta4):
+    if parent1 == 26:
+        breakpoint()
+    theta1 = points_info[parent1]['angle']
+    theta2 = points_info[parent2]['angle']
+    shared_arc = union_arcs(points_info[parent1]['arc_span'],points_info[parent2]['arc_span'])
+    theta3 = shared_arc[0][0]
+    theta4 = shared_arc[0][1]
+    
+
+    # Max possible half-widths
+    w1 = min(arc_span((theta3,theta1)), arc_span((theta1,theta4)))
+    w2 = min(arc_span((theta3,theta2)), arc_span((theta2,theta4)))
+    
+    max_alpha1 = 2 * w1
+    max_alpha2 = 2 * w2
+    
+    available_between = 2 * arc_span((theta1,theta2))
+    
+    if max_alpha1 + max_alpha2 <= available_between:
+        alpha1 = max_alpha1
+        alpha2 = max_alpha2
+    else:
+        total_weight = w1 + w2
+        alpha1 = available_between * (w1 / total_weight)
+        alpha2 = available_between * (w2 / total_weight)
+    
+    arc1_start = theta1 - alpha1 / 2
+    arc1_end = theta1 + alpha1 / 2
+    arc2_start = theta2 - alpha2 / 2
+    arc2_end = theta2 + alpha2 / 2
+    
+    return (
+        normalize_arc(arc1_start, arc1_end),
+        normalize_arc(arc2_start, arc2_end)
+    )
+
+
+def generate_network_coordinates(net, root_bus_index, network_edges, min_distance_m=10, max_attempts=50):    
     connections = {}
+    parent = {}
+    children = {}
     success = False
-    for vertix in network_vertices:
-        connections.setdefault(vertix['edges'][0], []).append({
-                                                                'destination' :vertix['edges'][1],
-                                                                'length': vertix['length']
-                                                              }               
-                                                             )
-        connections.setdefault(vertix['edges'][1], []).append(
-                                                               {
-                                                                'destination' :vertix['edges'][0],
-                                                                'length': vertix['length']
-                                                               }               
-                                                             )
+    for edge in network_edges:
+        connections.setdefault(edge['vertices'][0], []).append({
+                                                                'destination' :edge['vertices'][1],
+                                                                'length': edge['length']
+                                                              })  
+        
+        children.setdefault(edge['vertices'][0], []).append(edge['vertices'][1]) 
+        
+        parent[edge['vertices'][1]] =  edge['vertices'][0]   
+                                                                     
+        # connections.setdefault(edge['vertices'][1], []).append(
+        #                                                        {
+        #                                                         'destination' :edge['vertices'][0],
+        #                                                         'length': edge['length']
+        #                                                        }               
+        #                                                      )
 
+    points = {root_bus_index: ShapelyPoint(0.0, 0.0)}  # Start with the root bus at (0,0)
+    points_info = {root_bus_index: {
+                    'angle': 0.0,
+                    'radius': 100.0,
+                    'geometric_neighbors': None  # No siblings for the root
+                    }
+                    } 
 
-    points = {root_bus_index: ShapelyPoint(0.0, 0.0)}  # Start with the root bus at the given coordinates
     lines = []
     visited = set()
 
+    current_breadth = [root_bus_index]
+    
+    radius = 100.0    
+
+    def distribute_children_on_parent_arc(parent_node, arc, connections, points_info):                
+        if parent_node == 21:
+            breakpoint()
+        children = [node['destination'] for node in connections.get(parent_node, [])]
+        arc = normalize_arc(*arc)  # Normalize the arc to ensure it is in the correct range
+        if arc_span(arc) == 0: #the arc spans the whole circle:
+            if len(children) == 1:
+                angle_step = math.pi
+            else:    
+                angle_step = 2 * math.pi / len(children)  
+            arc = normalize_arc(points_info[parent_node]['angle']-math.pi, points_info[parent_node]['angle']+math.pi)  
+        else:
+            angle_step = arc_span(arc)/(len(children)+1) 
+            # if angle_step > math.pi/4:
+            #     # Instead of distributing across the whole arc, center children around the parent's angle
+            #     parent_angle = points_info[parent_node]['angle']
+            #     # Limit the arc to at most pi/2 (90 degrees) centered on parent_angle
+            #     arc_width = min((math.pi/4)*len(children) , arc_span(arc))
+            #     # Clamp start_angle to be within the arc's start and stop
+            #     unclamped_start_angle = parent_angle - arc_width / 2
+            #     start_angle = max(arc[0], min(unclamped_start_angle, arc[1] - arc_width))                
+            #     # Clamp the arc to stay within the original arc bounds
+            #     arc_start = max(arc[0], start_angle)
+            #     arc_end = min(arc[1], start_angle + arc_width)
+            #     arc = normalize_arc(arc_start, arc_end)
+            #     angle_step = arc_span(arc) / (len(children) + 1)
+
+        # Compute initial angles for this parent's children
+        angle_offsets = [arc[0] + (i+1) * angle_step for i in range(len(children))]
+
+        radius = points_info[parent_node]['radius'] + 100  # Increment radius for children
+        
+        points_info[parent_node]['arc_span'] = arc  # Store the arc span for the parent node
+        for child, offset in zip(children, angle_offsets): 
+            if child == 22:
+                breakpoint()
+            x = radius * math.cos(offset)
+            y = radius * math.sin(offset)
+            points[child] = ShapelyPoint(x, y)
+            points_info[child]['angle'] = offset
+
+    while len(current_breadth) > 0:
+
+        next_breadth = [n['destination'] for node in current_breadth for n in connections.get(node, [])]
+        
+        # For each parent in current_breadth, distribute its children evenly along a 360-degree arc centered on the parent direction
+        if next_breadth:
+            # Build a mapping from parent to its children
+            # Determine the neighboorhood in the next_breadth
+            parent_to_children = {}
+            for child in next_breadth:
+                parent_node = parent[child]
+                parent_to_children.setdefault(parent_node, []).append(child)
+
+                # Determine geometric neighbors: negative and positive siblings in next_breadth (wrap around if at ends)                    
+                if len(next_breadth) == 1:
+                    geometric_neighbors = None
+                else:
+                    idx = next_breadth.index(child)
+                    negative_idx = (idx - 1) % len(next_breadth)
+                    positive_idx = (idx + 1) % len(next_breadth)
+                    negative_neighbor = next_breadth[negative_idx]
+                    positive_neighbor = next_breadth[positive_idx]
+                    geometric_neighbors = (negative_neighbor, positive_neighbor)
+                points_info[child] = {
+                    'angle': None,
+                    'radius': radius,
+                    'geometric_neighbors': geometric_neighbors,
+                    'arc_span': None  # Will be calculated later
+                }
+                  
+            #create base arc for all parents in current_breadth
+            for parent_node, children in parent_to_children.items():                                
+                arc_span_per_child = (2*math.pi)/len(next_breadth)                                
+                base_angle = points_info[parent_node]['angle']            
+                my_arc = (base_angle - ((arc_span_per_child*len(children))/2), base_angle + ((arc_span_per_child*len(children))/2))
+                points_info[parent_node]['arc_span'] = normalize_arc(*my_arc)  
+
+            #adjust all arcs to prevent overlaps with geometric neighbors
+            for parent_node, children in parent_to_children.items(): 
+                if parent_node == 21:
+                    breakpoint()               
+                if points_info[parent_node]['geometric_neighbors'] is not None:
+                    if points_info[points_info[parent_node]['geometric_neighbors'][1]]['arc_span'] is not None:
+                        overlaped_arc = intersect_arcs(points_info[parent_node]['arc_span'],points_info[points_info[parent_node]['geometric_neighbors'][1]]['arc_span'])
+                        if overlaped_arc != []:
+                            my_new_arc, neighbor_new_arc = compute_nonoverlapping_subarcs(parent_node, points_info[parent_node]['geometric_neighbors'][1], points_info)                           
+
+
+                            # intersection = overlaped_arc[0]
+                            # my_new_arc = subtract_arc(points_info[parent_node]['arc_span'],intersection)
+                            # neighbor_new_arc = subtract_arc(points_info[points_info[parent_node]['geometric_neighbors'][1]]['arc_span'],intersection)
+                            
+                            # if my_new_arc != []:
+                            #     my_new_arc = add_arc(my_new_arc, (intersection[0], intersection[0]+arc_span(intersection)/2))                        
+                            # else:
+                            #     raise ValueError(f"Parent node {parent_node} has no arc span to adjust.")
+                                                
+                            # if neighbor_new_arc != []:
+                            #     neighbor_new_arc = add_arc(neighbor_new_arc, (intersection[1]-arc_span(intersection)/2, intersection[1]) )
+                            # else:
+                            #     raise ValueError(f"Neighbor node {points_info[parent_node]['geometric_neighbors'][1]} has no arc span to adjust.")                        
+                            
+                            # points_info[parent_node]['arc_span'] = my_new_arc[0]
+                            # points_info[points_info[parent_node]['geometric_neighbors'][1]]['arc_span'] = neighbor_new_arc[0]
+                            points_info[parent_node]['arc_span'] = my_new_arc
+                            points_info[points_info[parent_node]['geometric_neighbors'][1]]['arc_span'] = neighbor_new_arc
+            
+            #distribute children evenly along the calculated arcs
+            for parent_node, children in parent_to_children.items():                
+                if parent_node == 58:
+                    breakpoint()
+                #trim the arc to be centered on parent
+                angle = points_info[parent_node]['angle']
+                if angle < points_info[parent_node]['arc_span'][0]:
+                    angle += 2 * math.pi
+                left_arc_length = arc_span((points_info[parent_node]['arc_span'][0], angle))
+                right_arc_length = arc_span((angle, points_info[parent_node]['arc_span'][1]))
+                if left_arc_length > right_arc_length:
+                    # If left arc is longer, adjust the arc to be centered on the parent
+                    points_info[parent_node]['arc_span'] = normalize_arc(angle - left_arc_length, angle + right_arc_length)                       
+                elif (right_arc_length > left_arc_length):
+                    points_info[parent_node]['arc_span'] = normalize_arc(angle - right_arc_length, angle + right_arc_length)                                       
+                distribute_children_on_parent_arc(parent_node, points_info[parent_node]['arc_span'], connections, points_info)                               
+
+               
+        current_breadth = next_breadth
+        radius = radius + 100
+
     def bfs(start_node): #Breadth-First Node Placement
-        queue = deque([start_node])
+        # The queue now stores (current_bus_index, parent_bus_index)
+        queue = deque([(start_node, None)]) # Root node has no parent
         visited = set([start_node])
         point_tree = None
         line_tree = None
 
 
         while queue:
-            node = queue.popleft()
+            node, parent_node_index = queue.popleft() # Pop current node and its parent
             origin = points[node]
+            
+            # Determine grandpa_coordinate. If it's the root node, parent_node_index will be None.
+            grandpa_coordinate = points.get(parent_node_index)
+
+            # Rebuild STRtrees after each successful placement to keep them updated
+            if points:
+                point_geoms = list(points.values())
+                point_tree = STRtree(point_geoms)
+            else:
+                point_tree = None
+
+            if lines:
+                line_tree = STRtree(lines)
+            else:
+                line_tree = None
 
             for neighbor in connections.get(node, []):
                 dest = neighbor['destination']
@@ -270,6 +615,7 @@ def generate_network_coordinates(net, root_bus_index, network_vertices, min_dist
                                                 line_index=line_tree,                                                
                                                 placed_points_index=point_tree,
                                                 min_distance=min(min_distance_m, line_length_meters * 0.90),
+                                                grandpa_coordinate=grandpa_coordinate, # Pass grandpa_coordinate
                                                 iterations=12) 
 
                     if new_pos is None:
@@ -279,14 +625,15 @@ def generate_network_coordinates(net, root_bus_index, network_vertices, min_dist
                                         min_distance=min(min_distance_m, line_length_meters * 0.90)):
                         points[dest] = new_pos
                         lines.append(LineString([origin, new_pos]))
+                        
+                        # Rebuild STRtrees for the next iteration of this node's neighbors
+                        # (This is important to ensure the trees are always up-to-date)
                         point_geoms = list(points.values())
                         point_tree = STRtree(point_geoms)
-
-                        # Create STRtree for lines
                         line_tree = STRtree(lines)
 
                         visited.add(dest)
-                        queue.append(dest)
+                        queue.append((dest, node)) # Store current node as parent for the destination
                         placed = True
                         break
 
@@ -294,37 +641,8 @@ def generate_network_coordinates(net, root_bus_index, network_vertices, min_dist
                     return False  # failed to place one neighbor
 
         return True
-
-    def dfs(node): #Depth-First Node Placement
-        visited.add(node)
-        origin = points[node]
-        for neighbor in connections.get(node, []):
-            if neighbor['destination'] in visited:
-                continue
-            for _ in range(max_attempts):
-                line_length_meters = neighbor['length']
-                
-                new_pos = smart_random_destination(
-                                                origin_latlon=origin,
-                                                length_meters=line_length_meters, 
-                                                lines=lines,                                                
-                                                placed_points=points,
-                                                min_distance=min(min_distance_m, line_length_meters * 0.90),
-                                                iterations=12) 
-
-                if fast_is_valid_placement(new_pos, origin, points, lines,min_distance=min(min_distance_m,line_length_meters*0.90)):
-                    points[neighbor['destination']] = new_pos
-                    lines.append(LineString(origin, new_pos))
-                    if dfs(neighbor['destination']):
-                        break
-                    # backtrack
-                    lines.pop()
-                    points.pop(neighbor['destination'])
-            else:
-                return False
-        return True
-
-    success = bfs(root_bus_index)    
+    
+    success = True #bfs(root_bus_index)    
     return success, points 
 
 def random_destination(origin_latlon, length_meters):
@@ -333,42 +651,62 @@ def random_destination(origin_latlon, length_meters):
     destination = distance(meters=length_meters).destination(origin, angle)
     return (destination.latitude, destination.longitude)
 
-def smart_random_destination(origin_coordinate: ShapelyPoint, length_meters: float, line_index: STRtree, placed_points_index: STRtree, min_distance: float, iterations:int=10):            
+def smart_random_destination(origin_coordinate: ShapelyPoint, length_meters: float, line_index: STRtree, placed_points_index: STRtree, min_distance: float, grandpa_coordinate: ShapelyPoint = None, iterations:int=10):            
     chosen_angle = None
+    
+    # Determine the central heading based on the grandpa_coordinate and origin_coordinate
+    central_heading_degrees = None
+    if grandpa_coordinate and not origin_coordinate.equals(grandpa_coordinate):
+        dy = origin_coordinate.y - grandpa_coordinate.y
+        dx = origin_coordinate.x - grandpa_coordinate.x
+        central_heading_degrees = math.degrees(math.atan2(dy, dx))
+    
+    # Define the allowed angle range (120 degrees) or 360 degrees if no heading
+    if central_heading_degrees is None:
+        # If no heading (e.g., for the first node), allow 360 degrees
+        angle_range_min = 0.0
+        angle_range_max = 360.0
+    else:
+        # Define a 120-degree cone relative to the central heading
+        angle_range_min = central_heading_degrees - 60.0
+        angle_range_max = central_heading_degrees + 60.0
+
+    # Helper function to navigate from an origin point given an angle and length
+    def navigate_to(origin_coordinate: ShapelyPoint, angle, length_meters):
+        angle_rad = math.radians(angle)
+        dx = length_meters * math.cos(angle_rad)
+        dy = length_meters * math.sin(angle_rad)            
+        return ShapelyPoint(origin_coordinate.x + dx, origin_coordinate.y + dy)
 
     for i in range(iterations):
         if chosen_angle is not None:
             break
         
-        current_step = 360.0 / (2 ** i)
-        random_offset = random.uniform(0, current_step)
-        angles = [random_offset + j * current_step for j in range(int(360.0 / current_step))]
-        
-        def navigate_to(origin_coordinate: ShapelyPoint, angle, length_meters):
-            # Offset coordinate by length_meters in the direction of the angle (degrees)
-            angle_rad = math.radians(angle)
-            dx = length_meters * math.cos(angle_rad)
-            dy = length_meters * math.sin(angle_rad)            
-            return ShapelyPoint(origin_coordinate.x + dx, origin_coordinate.y + dy)
+        num_candidates = 2 ** i
+        if num_candidates == 0: # Ensure at least one candidate for i=0
+            num_candidates = 1
+        angle_step = (angle_range_max - angle_range_min) / num_candidates
+        angle_offset = random.uniform(-angle_step / 2, angle_step / 2)  # Randomize within the step
 
-        # Calculate candidate points using shapely cartesian algorithm (treating everything as cartesian)        
-        candidate_points = [navigate_to(origin_coordinate, angle, length_meters) for angle in angles]
-        
-        # Try candidates in random order, pick the first valid one
-        candidate_indices = list(range(len(candidate_points)))
-        random.shuffle(candidate_indices)
-        for idx in candidate_indices:
-            dest_coordinate = candidate_points[idx]            
+        angles_to_try = []
+        for j in range(num_candidates):
+            # Linearly distribute angles within the calculated range
+            angle = angle_offset + angle_range_min + j*angle_step
+            angles_to_try.append(angle) # Normalize to 0-360 degrees
+
+        random.shuffle(angles_to_try) # Randomize the order to try candidates
+
+        for dest_angle in angles_to_try:
+            dest_coordinate = navigate_to(origin_coordinate, dest_angle, length_meters)            
             if fast_is_valid_placement(dest_coordinate, origin_coordinate, placed_points_index, line_index, min_distance):
-                chosen_angle = angles[idx]
+                chosen_angle = dest_angle
                 break       
     
     if chosen_angle is not None:
+        print(f"Angle chosen: {chosen_angle} degrees after {i+1} iterations")
         return navigate_to(origin_coordinate, chosen_angle, length_meters)
     else:
         return None  # No valid destination found after all iterations
-        #raise RuntimeError("Could not find a valid destination after multiple attempts.")
-
 
 def is_valid_placement(new_point, from_point, placed_points, lines, min_distance):
     for pt in placed_points.values():
@@ -447,7 +785,7 @@ def fast_is_valid_placement(new_point: ShapelyPoint, from_point: ShapelyPoint, p
                     # AND it's not the line that connects directly to the 'from_point',
                     # AND the new point is not an endpoint of that existing line.
                     
-                    is_endpoint_of_existing_line = (new_point.equals(existing_line.coords[0]) or new_point.equals(existing_line.coords[-1]))
+                    is_endpoint_of_existing_line = (new_point.equals(ShapelyPoint(existing_line.coords[0])) or new_point.equals(ShapelyPoint(existing_line.coords[-1])))
                     
                     # The line being considered for connection (from_point to new_point)
                     potential_new_line = LineString([from_point, new_point])
@@ -459,42 +797,26 @@ def fast_is_valid_placement(new_point: ShapelyPoint, from_point: ShapelyPoint, p
                         # and it's not the line being currently built.
                         return False
 
-    # 3. Check new line (from_point to new_point) intersection/proximity with existing lines
+    # 3. Check new line (from_point to new_point) intersection with existing lines (not proximity)
     new_line = LineString([from_point, new_point])
-    
+
     if lines_index is not None:
-        # Buffer the new line to check for proximity to other lines
-        # Using a buffer of half the min_distance ensures that the centers of lines
-        # are at least min_distance apart. If you want the edges to be min_distance apart,
-        # you'd use min_distance directly.
-        buffered_new_line_for_clearance = new_line.buffer(min_distance, cap_style='flat', join_style='mitre')
-
-        # Query for lines within the bounding box of the buffered new line
-        nearby_lines_indices_for_clearance = lines_index.query(buffered_new_line_for_clearance)
-
-        for l_index in nearby_lines_indices_for_clearance:
+        nearby_lines_indices = lines_index.query(new_line)
+        for l_index in nearby_lines_indices:
             existing_line = lines_index.geometries[l_index]
-            
-            # Avoid checking the line against itself if it somehow gets included
             if new_line.equals(existing_line):
                 continue
-
-            # If the buffered new line intersects with an existing line, it means they are too close
-            if buffered_new_line_for_clearance.intersects(existing_line):
-                intersection = buffered_new_line_for_clearance.intersection(existing_line)
-                
+            if new_line.intersects(existing_line):
+                intersection = new_line.intersection(existing_line)
                 # Allow intersection only if it's exactly at a common endpoint of the *unbuffered* lines
-                # This ensures that lines connected to the same bus are not flagged as violations
                 if isinstance(intersection, ShapelyPoint):
-                    # Check if the intersection point is an endpoint of both the new_line AND the existing_line
                     is_endpoint_of_newline = (intersection.equals(from_point) or intersection.equals(new_point))
-                    is_endpoint_of_existingline = (intersection.equals(existing_line.coords[0]) or intersection.equals(existing_line.coords[-1]))
-                    
+                    is_endpoint_of_existingline = (
+                        intersection.equals(ShapelyPoint(existing_line.coords[0])) or
+                        intersection.equals(ShapelyPoint(existing_line.coords[-1]))
+                    )
                     if is_endpoint_of_newline and is_endpoint_of_existingline:
-                        # If it's a shared endpoint, it's allowed.
                         continue
-                
-                # If there's an intersection not at a shared endpoint (e.g., crossing or just too close along the line)
                 return False
 
     return True  # No invalid intersections found
