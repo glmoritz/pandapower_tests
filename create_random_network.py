@@ -1,13 +1,18 @@
 import pandapower as pp
+import pandas as pd
 import random
 from enum import Enum
 import random
 import math
-from shapely.geometry import Point as ShapelyPoint, LineString
+from shapely.geometry import Point as ShapelyPoint, LineString, MultiLineString
 from shapely.strtree import STRtree
+from shapely import affinity
+from shapely import distance as shapely_distance
 from geopy.distance import distance
 from geopy.point import Point as GeopyPoint
 from collections import deque
+import networkx as nx
+import numpy as np
 
 
 class NetworkType(Enum):
@@ -20,6 +25,10 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
                             mv_bus_coordinates=(0.0, 0.0),
                             ):    
     net_cigre_lv = pp.create_empty_network()
+
+    random.seed(3333)
+
+    graph = nx.DiGraph()
 
     # Linedata
     # UG1
@@ -79,19 +88,14 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
                                             pfe_kw=0.0, i0_percent=0.0, shift_degree=30,
                                             tap_pos=0.0, name=name)
 
-    def add_transformer_branch(transformer_type, branch_index, parent_bus, current_net):
+    def add_transformer_branch(transformer_type, branch_index, parent_bus, current_net, graph):
         # Create LV bus (0.4 kV)        
         working_bus_name = f"{str(transformer_type)}_Branch{branch_index}_trafo_lv_bus"
         working_bus = pp.create_bus(current_net, vn_kv=0.4, name=working_bus_name)        
 
         # Add transformer from MV to LV
         create_cigre_lv_transformer(parent_bus, working_bus, f"{str(transformer_type)}_{branch_index}_Trafo", transformer_type)
-        network_edges = [
-                    {
-                        'vertices': (parent_bus,working_bus),
-                        'length': 100.0
-                    }
-                    ]
+        graph.add_edge(parent_bus, working_bus)            
                 
         #randomize how many forks this line will be
         Forks = random.randint(*LineForksRange)
@@ -134,12 +138,7 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
 
                 #create a line connecting the parent bus to the child bus
                 pp.create_line(current_net, working_bus, new_bus, length_km=fork_hop_lengths[f][b], std_type='OH1', name=f'Line {net_cigre_lv.bus.at[working_bus, 'name']}-{net_cigre_lv.bus.at[new_bus, 'name']}')
-                network_edges.append(
-                    {
-                        'vertices': (working_bus, new_bus),
-                        'length': fork_hop_lengths[f][b]
-                    }
-                )
+                graph.add_edge(working_bus, new_bus)                            
                 added_busses.append(new_bus)    
 
                 working_bus = new_bus
@@ -154,73 +153,78 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
             # Retrieve the parent_bus_name from net_cigre_lv
             working_bus_name = net_cigre_lv.bus.at[parent_bus, 'name']
         
-        return network_edges
+        return added_busses
 
     # Create transformers by type
     Ct = random.randint(*CommercialRange)
     It = random.randint(*IndustrialRange)
     Rt = random.randint(*ResidencialRange)
     
-    total_net_lines = []
+    
 
     for i in range(Ct):
         new_lines = add_transformer_branch(
             transformer_type=NetworkType.COMMERCIAL,
             branch_index=i,
             parent_bus=mv_bus,
-            current_net= net_cigre_lv            
-            )
-        total_net_lines.extend(new_lines)
+            current_net= net_cigre_lv,
+            graph=graph            
+            )        
     for i in range(It):
         new_lines = add_transformer_branch(
             transformer_type=NetworkType.INDUSTRIAL,
             branch_index=i,
             parent_bus=mv_bus,
-            current_net= net_cigre_lv            
-            )
-        total_net_lines.extend(new_lines)
+            current_net= net_cigre_lv,
+            graph=graph                        
+            )    
     for i in range(Rt):
         new_lines = add_transformer_branch(
             transformer_type=NetworkType.RESIDENTIAL,
             branch_index=i,
             parent_bus=mv_bus,
-            current_net= net_cigre_lv            
-            )
-        total_net_lines.extend(new_lines)
+            current_net= net_cigre_lv,
+            graph=graph                        
+            )        
 
-    success, points = generate_network_coordinates(
+    success = generate_network_coordinates(
         net=net_cigre_lv,
         root_bus_index=mv_bus,        
-        network_edges=total_net_lines,
+        graph=graph,
         min_distance_m=5,  # Minimum distance between points
         max_attempts=50  # Maximum attempts to place a point
     )
-
-    # Bus geo data
-    origin = GeopyPoint(mv_bus_coordinates[0], mv_bus_coordinates[1])
     
-    def cartesian_to_latlon(x, y, origin_point):
-        # Compute bearing and distance
-        angle = math.degrees(math.atan2(y, x))  # bearing in degrees
-        dist = math.hypot(x, y)  # Euclidean distance in meters
-        destination = distance(meters=dist).destination(origin_point, angle)
-        return destination.latitude, destination.longitude
+    
+    # Initialize bus_geodata if it doesn't exist
+    if net_cigre_lv.bus_geodata.empty:
+        net_cigre_lv.bus_geodata = pd.DataFrame(columns=['x', 'y'])
 
-    # Convert each bus point to lat/lon GeoJSON string
-    bus_geodata = [
-        (
-            f'{{"type":"Point", "coordinates":[{lon}, {lat}]}}'
-            if idx in points else None
-        )
-        for idx in net_cigre_lv.bus.index
-        for lat, lon in [
-            cartesian_to_latlon(points[idx].x, points[idx].y, origin)
-            if idx in points else (None, None)
-        ]
-    ]
+    for node in graph.nodes:
+        # Get XY in graph
+        node_coords = graph.nodes[node]['coordinates']
+        
+        # Convert XY offset into lat/lon
+        point_lat = distance(meters=node_coords.y).destination(mv_bus_coordinates, bearing=0).latitude
+        point_lon = distance(meters=node_coords.x).destination(mv_bus_coordinates, bearing=0).longitude
 
-    net_cigre_lv.bus["geo"] = bus_geodata
-    return net_cigre_lv, total_net_lines
+        final_point = GeopyPoint(point_lat, point_lon)
+        
+
+        lat, lon = final_point.latitude, final_point.longitude
+
+        #Update bus_geodata with local XY
+        net_cigre_lv.bus_geodata.loc[node, 'x'] = node_coords.x
+        net_cigre_lv.bus_geodata.loc[node, 'y'] = node_coords.y
+
+        #update bus table with lat/lon
+        net_cigre_lv.bus.loc[node, 'lat'] = lat
+        net_cigre_lv.bus.loc[node, 'lon'] = lon
+
+        #update graph node with latlon
+        graph.nodes[node]['latlon'] = GeopyPoint(lat, lon)
+
+    return net_cigre_lv, graph
 
 
 def arc_span(arc):
@@ -368,13 +372,10 @@ def intersect_arcs(a, b):
     else:
         return []  # no overlap
 
-def compute_nonoverlapping_subarcs(parent1, parent2, points_info):
-#def compute_nonoverlapping_subarcs(theta3, theta1, theta2, theta4):
-    if parent1 == 26:
-        breakpoint()
-    theta1 = points_info[parent1]['angle']
-    theta2 = points_info[parent2]['angle']
-    shared_arc = union_arcs(points_info[parent1]['arc_span'],points_info[parent2]['arc_span'])
+def compute_nonoverlapping_subarcs(parent1, parent2, graph):    
+    theta1 = graph.nodes[parent1]['angle']
+    theta2 = graph.nodes[parent2]['angle']
+    shared_arc = union_arcs(graph.nodes[parent1]['arc_span'],graph.nodes[parent2]['arc_span'])
     theta3 = shared_arc[0][0]
     theta4 = shared_arc[0][1]
     
@@ -406,244 +407,250 @@ def compute_nonoverlapping_subarcs(parent1, parent2, points_info):
         normalize_arc(arc2_start, arc2_end)
     )
 
+def polar_to_cartesian(radius, angle):
+    return radius * math.cos(angle), radius * math.sin(angle)
 
-def generate_network_coordinates(net, root_bus_index, network_edges, min_distance_m=10, max_attempts=50):    
-    connections = {}
-    parent = {}
-    children = {}
-    success = False
-    for edge in network_edges:
-        connections.setdefault(edge['vertices'][0], []).append({
-                                                                'destination' :edge['vertices'][1],
-                                                                'length': edge['length']
-                                                              })  
+def get_vertex_coordinate(vertex, graph):
+    """Get the Cartesian coordinates of a vertex in the graph."""
+    if vertex not in graph.nodes:
+        raise ValueError(f"Vertex {vertex} not found in the graph.")
+    
+    if graph.nodes[vertex]['coordinates'] is None:
+        radius = graph.nodes[vertex]['radius']
+        angle = graph.nodes[vertex]['angle']
+        graph.nodes[vertex]['coordinates'] = polar_to_cartesian(radius, angle)
+    return graph.nodes[vertex]['coordinates']
+
+def randomize_position(vertex, graph, max_angle, max_distance):
+    delta_theta = random.gauss(0, max_angle)    
+    
+    
         
-        children.setdefault(edge['vertices'][0], []).append(edge['vertices'][1]) 
-        
-        parent[edge['vertices'][1]] =  edge['vertices'][0]   
-                                                                     
-        # connections.setdefault(edge['vertices'][1], []).append(
-        #                                                        {
-        #                                                         'destination' :edge['vertices'][0],
-        #                                                         'length': edge['length']
-        #                                                        }               
-        #                                                      )
+    parent = list(graph.predecessors(vertex))[0] if list(graph.predecessors(vertex)) else None
 
-    points = {root_bus_index: ShapelyPoint(0.0, 0.0)}  # Start with the root bus at (0,0)
-    points_info = {root_bus_index: {
-                    'angle': 0.0,
-                    'radius': 100.0,
-                    'geometric_neighbors': None  # No siblings for the root
-                    }
-                    } 
+    #node -> P2, parent -> P1
+    p2 = get_vertex_coordinate(vertex, graph)
+    p1 = get_vertex_coordinate(parent, graph) if parent else ShapelyPoint(0, 0)    
+    r = shapely_distance(p1,p2)
 
+    # 2. Calculate the angle alpha of the line P1 P2 relative to the positive x-axis
+    # math.atan2(y, x) handles all quadrants correctly.
+    theta = math.atan2(p2.y - p1.y, p2.x - p1.x)
+
+    # 3. Calculate the new angle alpha_prime
+    # The new point P2' will be at an angle dtheta relative to the original P1P2 line.
+    theta_prime = theta + delta_theta
+
+    # 4. Calculate the new distance d_prime from P1 to P2'
+    r_prime = 0
+    while r_prime < 50:
+        delta_r = random.gauss(0, max_distance)
+        r_prime = r + delta_r
+
+    # 5. Calculate the Cartesian coordinates of the new point P2_prime
+    dx = r_prime * math.cos(theta_prime)
+    dy = r_prime * math.sin(theta_prime)
+
+    p2prime = ShapelyPoint(p1.x+dx,p1.y+dy)
+    dp2 = ShapelyPoint(p2prime.x - p2.x, p2prime.y - p2.y)
+
+    # 6. Convert P2_prime back to polar coordinates (r2_prime, theta2_prime)
+    r2_prime = shapely_distance(p2prime,ShapelyPoint(0,0))
+    theta2_prime = math.atan2(p2prime.y, p2prime.x)
+
+    return p2prime,dp2.x,dp2.y,delta_r,delta_theta
+    
+ 
+def build_multilines_from_edges(edges, graph):
     lines = []
-    visited = set()
+    for src, dst in edges:        
+        p1 = get_vertex_coordinate(src, graph)
+        p2 = get_vertex_coordinate(dst, graph)
+        lines.append(LineString([p1, p2]))
+    return MultiLineString(lines)
 
+
+def randomize_branch_positions(graph, vertex_to_randomize, max_trials=50):
+    subtree_nodes = set(nx.descendants(graph, vertex_to_randomize)) | {vertex_to_randomize}
+    main_nodes = set(graph.nodes) - subtree_nodes
+
+    main_edges = list(graph.subgraph(main_nodes).edges)
+    branch_edges = list(graph.subgraph(subtree_nodes).edges)
+        
+    # Build geometries
+    main_geom = build_multilines_from_edges(main_edges, graph)
+    branch_geom = build_multilines_from_edges(branch_edges, graph)
+
+    # Current root position (for connection constraint)    
+    parent_pos = get_vertex_coordinate(list(graph.predecessors(vertex_to_randomize))[0], graph) if list(graph.predecessors(vertex_to_randomize)) else ShapelyPoint(0, 0)    
+    original_coords = np.array([graph.nodes[node]['coordinates'] for node in subtree_nodes])
+
+    for trial in range(max_trials):
+        # New random position
+        new_vertex_pos,dx,dy,dr,dtheta =  randomize_position(vertex_to_randomize, graph, (20.0*math.pi)/180, 200.0)
+
+        # Apply transforms to geometry
+        transformed_branch = affinity.rotate(branch_geom, math.degrees(dtheta), origin=parent_pos)
+        transformed_branch = affinity.translate(transformed_branch, dx, dy)
+
+        #this is the new edge from parent to the randomized vertex
+        connection_line = LineString([parent_pos, new_vertex_pos])
+
+        # Check overlap
+        if transformed_branch.crosses(main_geom) or connection_line.crosses(main_geom):
+            continue  # Failed, try again
+
+        if vertex_to_randomize == 4:
+            breakpoint()
+
+        print(f'{vertex_to_randomize};{dtheta/math.pi*180};{dr}')
+        
+        if len(original_coords) > 0: #if there is a subtree, rotate it
+            # --- Vectorized rotation + translation ---
+            # Shift to origin, rotate, shift back, then translate        
+            coords_array = np.array([(p.x, p.y) for p in original_coords])
+
+            # Center relative to parent
+            parent_coord = np.array([parent_pos.x, parent_pos.y])
+            centered_coords = coords_array - parent_coord  # parent_pos should be (x, y) tuple or array
+
+            # Rotation matrix
+            rot_matrix = np.array([
+                [math.cos(dtheta), -math.sin(dtheta)],
+                [math.sin(dtheta),  math.cos(dtheta)]
+            ])
+
+            # Apply rotation
+            rotated = centered_coords @ rot_matrix.T  
+
+            # Apply translation
+            translated = rotated + parent_coord + np.array([dx, dy])
+
+            # Convert back to Shapely Points
+            new_coords = [ShapelyPoint(x, y) for x, y in translated]
+
+            # Update graph
+            for i, node in enumerate(subtree_nodes):
+                graph.nodes[node]['coordinates'] = new_coords[i]
+
+        graph.nodes[vertex_to_randomize]['coordinates'] = new_vertex_pos
+        return True
+   
+    return False
+
+
+
+def generate_network_coordinates(net, root_bus_index, graph: nx.DiGraph, min_distance_m=10, max_attempts=50):    
+    
+    success = False    
+    
+    graph.nodes[root_bus_index]['coordinates'] = ShapelyPoint(0.0, 0.0)
+    graph.nodes[root_bus_index]['angle'] = 0.0
+    graph.nodes[root_bus_index]['radius'] = 0.0
+    graph.nodes[root_bus_index]['geometric_neighbors'] = None
+    
     current_breadth = [root_bus_index]
     
     radius = 100.0    
 
-    def distribute_children_on_parent_arc(parent_node, arc, connections, points_info):                
-        if parent_node == 21:
-            breakpoint()
-        children = [node['destination'] for node in connections.get(parent_node, [])]
+    def distribute_children_on_parent_arc(parent_node, arc, graph):                        
+        
+        children = list(graph.successors(parent_node))        
         arc = normalize_arc(*arc)  # Normalize the arc to ensure it is in the correct range
         if arc_span(arc) == 0: #the arc spans the whole circle:
             if len(children) == 1:
                 angle_step = math.pi
             else:    
-                angle_step = 2 * math.pi / len(children)  
-            arc = normalize_arc(points_info[parent_node]['angle']-math.pi, points_info[parent_node]['angle']+math.pi)  
+                angle_step = 2 * math.pi / len(children)
+            
+            arc = normalize_arc(graph.nodes[parent_node]['angle']-math.pi, graph.nodes[parent_node]['angle']+math.pi)  
         else:
-            angle_step = arc_span(arc)/(len(children)+1) 
-            # if angle_step > math.pi/4:
-            #     # Instead of distributing across the whole arc, center children around the parent's angle
-            #     parent_angle = points_info[parent_node]['angle']
-            #     # Limit the arc to at most pi/2 (90 degrees) centered on parent_angle
-            #     arc_width = min((math.pi/4)*len(children) , arc_span(arc))
-            #     # Clamp start_angle to be within the arc's start and stop
-            #     unclamped_start_angle = parent_angle - arc_width / 2
-            #     start_angle = max(arc[0], min(unclamped_start_angle, arc[1] - arc_width))                
-            #     # Clamp the arc to stay within the original arc bounds
-            #     arc_start = max(arc[0], start_angle)
-            #     arc_end = min(arc[1], start_angle + arc_width)
-            #     arc = normalize_arc(arc_start, arc_end)
-            #     angle_step = arc_span(arc) / (len(children) + 1)
+            angle_step = arc_span(arc)/(len(children)+1)            
 
         # Compute initial angles for this parent's children
         angle_offsets = [arc[0] + (i+1) * angle_step for i in range(len(children))]
-
-        radius = points_info[parent_node]['radius'] + 100  # Increment radius for children
         
-        points_info[parent_node]['arc_span'] = arc  # Store the arc span for the parent node
-        for child, offset in zip(children, angle_offsets): 
-            if child == 22:
-                breakpoint()
+        radius = graph.nodes[parent_node]['radius'] + 100  # Increment radius for children                
+        graph.nodes[parent_node]['arc_span'] = arc
+        for child, offset in zip(children, angle_offsets):         
             x = radius * math.cos(offset)
-            y = radius * math.sin(offset)
-            points[child] = ShapelyPoint(x, y)
-            points_info[child]['angle'] = offset
+            y = radius * math.sin(offset)            
+            graph.nodes[child]['coordinates'] = ShapelyPoint(x, y)
+            graph.nodes[child]['angle'] = offset
+            graph.nodes[child]['radius'] = radius
+            
 
-    while len(current_breadth) > 0:
-
-        next_breadth = [n['destination'] for node in current_breadth for n in connections.get(node, [])]
+    while len(current_breadth) > 0:        
+        
+        next_breadth = [child for node in current_breadth for child in graph.successors(node)]
         
         # For each parent in current_breadth, distribute its children evenly along a 360-degree arc centered on the parent direction
-        if next_breadth:
-            # Build a mapping from parent to its children
-            # Determine the neighboorhood in the next_breadth
-            parent_to_children = {}
-            for child in next_breadth:
-                parent_node = parent[child]
-                parent_to_children.setdefault(parent_node, []).append(child)
-
+        if next_breadth:            
+            # Determine the neighboorhood in the next_breadth            
+            for vertex in next_breadth:                
                 # Determine geometric neighbors: negative and positive siblings in next_breadth (wrap around if at ends)                    
                 if len(next_breadth) == 1:
                     geometric_neighbors = None
                 else:
-                    idx = next_breadth.index(child)
+                    idx = next_breadth.index(vertex)
                     negative_idx = (idx - 1) % len(next_breadth)
                     positive_idx = (idx + 1) % len(next_breadth)
                     negative_neighbor = next_breadth[negative_idx]
                     positive_neighbor = next_breadth[positive_idx]
                     geometric_neighbors = (negative_neighbor, positive_neighbor)
-                points_info[child] = {
-                    'angle': None,
-                    'radius': radius,
-                    'geometric_neighbors': geometric_neighbors,
-                    'arc_span': None  # Will be calculated later
-                }
+                
+                graph.nodes[vertex]['geometric_neighbors'] = geometric_neighbors
                   
-            #create base arc for all parents in current_breadth
-            for parent_node, children in parent_to_children.items():                                
-                arc_span_per_child = (2*math.pi)/len(next_breadth)                                
-                base_angle = points_info[parent_node]['angle']            
-                my_arc = (base_angle - ((arc_span_per_child*len(children))/2), base_angle + ((arc_span_per_child*len(children))/2))
-                points_info[parent_node]['arc_span'] = normalize_arc(*my_arc)  
+            #create base arc for all parents in current_breadth            
+            for vertex in current_breadth:                                
+                children = list(graph.successors(vertex))
+                if len(children) > 0:                    
+                    arc_span_per_child = (2*math.pi)/len(next_breadth)                                
+                    base_angle = graph.nodes[vertex]['angle']                     
+                    my_arc = (base_angle - ((arc_span_per_child*len(children))/2), base_angle + ((arc_span_per_child*len(children))/2))
+                    graph.nodes[vertex]['arc_span'] = normalize_arc(*my_arc)                    
 
-            #adjust all arcs to prevent overlaps with geometric neighbors
-            for parent_node, children in parent_to_children.items(): 
-                if parent_node == 21:
-                    breakpoint()               
-                if points_info[parent_node]['geometric_neighbors'] is not None:
-                    if points_info[points_info[parent_node]['geometric_neighbors'][1]]['arc_span'] is not None:
-                        overlaped_arc = intersect_arcs(points_info[parent_node]['arc_span'],points_info[points_info[parent_node]['geometric_neighbors'][1]]['arc_span'])
-                        if overlaped_arc != []:
-                            my_new_arc, neighbor_new_arc = compute_nonoverlapping_subarcs(parent_node, points_info[parent_node]['geometric_neighbors'][1], points_info)                           
-
-
-                            # intersection = overlaped_arc[0]
-                            # my_new_arc = subtract_arc(points_info[parent_node]['arc_span'],intersection)
-                            # neighbor_new_arc = subtract_arc(points_info[points_info[parent_node]['geometric_neighbors'][1]]['arc_span'],intersection)
-                            
-                            # if my_new_arc != []:
-                            #     my_new_arc = add_arc(my_new_arc, (intersection[0], intersection[0]+arc_span(intersection)/2))                        
-                            # else:
-                            #     raise ValueError(f"Parent node {parent_node} has no arc span to adjust.")
-                                                
-                            # if neighbor_new_arc != []:
-                            #     neighbor_new_arc = add_arc(neighbor_new_arc, (intersection[1]-arc_span(intersection)/2, intersection[1]) )
-                            # else:
-                            #     raise ValueError(f"Neighbor node {points_info[parent_node]['geometric_neighbors'][1]} has no arc span to adjust.")                        
-                            
-                            # points_info[parent_node]['arc_span'] = my_new_arc[0]
-                            # points_info[points_info[parent_node]['geometric_neighbors'][1]]['arc_span'] = neighbor_new_arc[0]
-                            points_info[parent_node]['arc_span'] = my_new_arc
-                            points_info[points_info[parent_node]['geometric_neighbors'][1]]['arc_span'] = neighbor_new_arc
+            #adjust all arcs to prevent overlaps with geometric neighbors            
+            for vertex in current_breadth:                 
+                children = list(graph.successors(vertex))
+                if len(children) > 0:                    
+                    if graph.nodes[vertex]['geometric_neighbors'] is not None:
+                        if 'arc_span' in graph.nodes[graph.nodes[vertex]['geometric_neighbors'][1]]:
+                            overlaped_arc = intersect_arcs(graph.nodes[vertex]['arc_span'],graph.nodes[graph.nodes[vertex]['geometric_neighbors'][1]]['arc_span'])
+                            if overlaped_arc != []:
+                                my_new_arc, neighbor_new_arc = compute_nonoverlapping_subarcs(vertex, graph.nodes[vertex]['geometric_neighbors'][1], graph) 
+                                graph.nodes[vertex]['arc_span'] = my_new_arc
+                                graph.nodes[graph.nodes[vertex]['geometric_neighbors'][1]]['arc_span'] = neighbor_new_arc
             
             #distribute children evenly along the calculated arcs
-            for parent_node, children in parent_to_children.items():                
-                if parent_node == 58:
-                    breakpoint()
-                #trim the arc to be centered on parent
-                angle = points_info[parent_node]['angle']
-                if angle < points_info[parent_node]['arc_span'][0]:
-                    angle += 2 * math.pi
-                left_arc_length = arc_span((points_info[parent_node]['arc_span'][0], angle))
-                right_arc_length = arc_span((angle, points_info[parent_node]['arc_span'][1]))
-                if left_arc_length > right_arc_length:
-                    # If left arc is longer, adjust the arc to be centered on the parent
-                    points_info[parent_node]['arc_span'] = normalize_arc(angle - left_arc_length, angle + right_arc_length)                       
-                elif (right_arc_length > left_arc_length):
-                    points_info[parent_node]['arc_span'] = normalize_arc(angle - right_arc_length, angle + right_arc_length)                                       
-                distribute_children_on_parent_arc(parent_node, points_info[parent_node]['arc_span'], connections, points_info)                               
+            for vertex in current_breadth: 
+                children = list(graph.successors(vertex))
+                if len(children) > 0:
+                    #trim the arc to be centered on parent
+                    angle = graph.nodes[vertex]['angle']
+                    if angle < graph.nodes[vertex]['arc_span'][0]:
+                        angle += 2 * math.pi
+                    semi_arc_length = min(arc_span((graph.nodes[vertex]['arc_span'][0], angle)),arc_span((angle, graph.nodes[vertex]['arc_span'][1])))
+                                        
+                    graph.nodes[vertex]['arc_span'] = normalize_arc(angle - semi_arc_length, angle + semi_arc_length)                       
+                    
+                    distribute_children_on_parent_arc(vertex, graph.nodes[vertex]['arc_span'], graph)                               
 
                
         current_breadth = next_breadth
         radius = radius + 100
-
-    def bfs(start_node): #Breadth-First Node Placement
-        # The queue now stores (current_bus_index, parent_bus_index)
-        queue = deque([(start_node, None)]) # Root node has no parent
-        visited = set([start_node])
-        point_tree = None
-        line_tree = None
-
-
-        while queue:
-            node, parent_node_index = queue.popleft() # Pop current node and its parent
-            origin = points[node]
-            
-            # Determine grandpa_coordinate. If it's the root node, parent_node_index will be None.
-            grandpa_coordinate = points.get(parent_node_index)
-
-            # Rebuild STRtrees after each successful placement to keep them updated
-            if points:
-                point_geoms = list(points.values())
-                point_tree = STRtree(point_geoms)
-            else:
-                point_tree = None
-
-            if lines:
-                line_tree = STRtree(lines)
-            else:
-                line_tree = None
-
-            for neighbor in connections.get(node, []):
-                dest = neighbor['destination']
-                if dest in visited:
-                    continue
-
-                placed = False
-                for _ in range(max_attempts):
-                    line_length_meters = neighbor['length']
-                   
-                    new_pos = smart_random_destination(
-                                                origin_coordinate=origin,
-                                                length_meters=line_length_meters, 
-                                                line_index=line_tree,                                                
-                                                placed_points_index=point_tree,
-                                                min_distance=min(min_distance_m, line_length_meters * 0.90),
-                                                grandpa_coordinate=grandpa_coordinate, # Pass grandpa_coordinate
-                                                iterations=12) 
-
-                    if new_pos is None:
-                        break
-
-                    if fast_is_valid_placement(new_pos, origin, point_tree, line_tree,
-                                        min_distance=min(min_distance_m, line_length_meters * 0.90)):
-                        points[dest] = new_pos
-                        lines.append(LineString([origin, new_pos]))
-                        
-                        # Rebuild STRtrees for the next iteration of this node's neighbors
-                        # (This is important to ensure the trees are always up-to-date)
-                        point_geoms = list(points.values())
-                        point_tree = STRtree(point_geoms)
-                        line_tree = STRtree(lines)
-
-                        visited.add(dest)
-                        queue.append((dest, node)) # Store current node as parent for the destination
-                        placed = True
-                        break
-
-                if not placed:
-                    return False  # failed to place one neighbor
-
-        return True
+   
+    count = 0
+    #now randomize the positions of the branches
+    for node in nx.bfs_tree(graph, root_bus_index):
+        if node == root_bus_index:
+            continue  # Skip the root        
+        randomize_branch_positions(graph, node)
+        count += 1
+     
     
     success = True #bfs(root_bus_index)    
-    return success, points 
+    return success, graph 
 
 def random_destination(origin_latlon, length_meters):
     angle = random.uniform(0, 360)  # bearing in degrees
