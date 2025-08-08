@@ -4,7 +4,7 @@ import random
 from enum import Enum
 import random
 import math
-from shapely.geometry import Point as ShapelyPoint, LineString, MultiLineString
+from shapely.geometry import Point as ShapelyPoint, LineString, MultiLineString, MultiPoint as ShapelyMultipoint
 from shapely.strtree import STRtree
 from shapely import affinity
 from shapely import distance as shapely_distance
@@ -24,9 +24,10 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
                             ForkLengthRange, LineBusesRange, LineForksRange,
                             mv_bus_coordinates=(0.0, 0.0),
                             ):    
-    net_cigre_lv = pp.create_empty_network()
+    random_net_lv = pp.create_empty_network()
 
-    random.seed(3333)
+    
+    #random.seed(3333)
 
     graph = nx.DiGraph()
 
@@ -35,55 +36,60 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
     line_data = {'c_nf_per_km': 0.0, 'r_ohm_per_km': 0.162,
                  'x_ohm_per_km': 0.0832, 'max_i_ka': 1.0,
                  'type': 'cs'}
-    pp.create_std_type(net_cigre_lv, line_data, name='UG1', element='line')
+    pp.create_std_type(random_net_lv, line_data, name='UG1', element='line')
 
     # UG2
     line_data = {'c_nf_per_km': 0.0, 'r_ohm_per_km': 0.2647,
                  'x_ohm_per_km': 0.0823, 'max_i_ka': 1.0,
                  'type': 'cs'}
-    pp.create_std_type(net_cigre_lv, line_data, name='UG2', element='line')
+    pp.create_std_type(random_net_lv, line_data, name='UG2', element='line')
 
     # UG3
     line_data = {'c_nf_per_km': 0.0, 'r_ohm_per_km': 0.822,
                  'x_ohm_per_km': 0.0847, 'max_i_ka': 1.0,
                  'type': 'cs'}
-    pp.create_std_type(net_cigre_lv, line_data, name='UG3', element='line')
+    pp.create_std_type(random_net_lv, line_data, name='UG3', element='line')
 
     # OH1
     line_data = {'c_nf_per_km': 0.0, 'r_ohm_per_km': 0.4917,
                  'x_ohm_per_km': 0.2847, 'max_i_ka': 1.0,
                  'type': 'ol'}
-    pp.create_std_type(net_cigre_lv, line_data, name='OH1', element='line')
+    pp.create_std_type(random_net_lv, line_data, name='OH1', element='line')
 
     # OH2
     line_data = {'c_nf_per_km': 0.0, 'r_ohm_per_km': 1.3207,
                  'x_ohm_per_km': 0.321, 'max_i_ka': 1.0,
                  'type': 'ol'}
-    pp.create_std_type(net_cigre_lv, line_data, name='OH2', element='line')
+    pp.create_std_type(random_net_lv, line_data, name='OH2', element='line')
 
     # OH3
     line_data = {'c_nf_per_km': 0.0, 'r_ohm_per_km': 2.0167,
                  'x_ohm_per_km': 0.3343, 'max_i_ka': 1.0,
                  'type': 'ol'}
-    pp.create_std_type(net_cigre_lv, line_data, name='OH3', element='line')
+    pp.create_std_type(random_net_lv, line_data, name='OH3', element='line')
 
     # Add the main 20 kV bus (medium voltage)
-    mv_bus = pp.create_bus(net_cigre_lv, name='Bus 0', vn_kv=20.0, type='b', zone='CIGRE_LV')
+    mv_bus = pp.create_bus(random_net_lv, name='MV Bus', vn_kv=20.0, type='b', zone='CIGRE_LV')
     
+    # External grid
+    pp.create_ext_grid(random_net_lv, mv_bus, vm_pu=1.0, va_degree=0.0, s_sc_max_mva=100.0,
+                    s_sc_min_mva=100.0, rx_max=1.0, rx_min=1.0)
+
+
 
     def create_cigre_lv_transformer(hv_bus, lv_bus, name, transformer_type):
         if transformer_type == NetworkType.RESIDENTIAL:
-            pp.create_transformer_from_parameters(net_cigre_lv, hv_bus, lv_bus, sn_mva=0.5, vn_hv_kv=20.0,
+            pp.create_transformer_from_parameters(random_net_lv, hv_bus, lv_bus, sn_mva=0.5, vn_hv_kv=20.0,
                                        vn_lv_kv=0.4, vkr_percent=1.0, vk_percent=4.123106,
                                        pfe_kw=0.0, i0_percent=0.0, shift_degree=30,
                                        tap_pos=0.0, name=name)
         elif transformer_type == NetworkType.INDUSTRIAL:
-            pp.create_transformer_from_parameters(net_cigre_lv, hv_bus, lv_bus, sn_mva=0.15, vn_hv_kv=20.0,
+            pp.create_transformer_from_parameters(random_net_lv, hv_bus, lv_bus, sn_mva=0.15, vn_hv_kv=20.0,
                                             vn_lv_kv=0.4, vkr_percent=1.003125, vk_percent=4.126896,
                                             pfe_kw=0.0, i0_percent=0.0, shift_degree=30,
                                             tap_pos=0.0, name=name)
         elif transformer_type == NetworkType.COMMERCIAL:
-            pp.create_transformer_from_parameters(net_cigre_lv, hv_bus, lv_bus, sn_mva=0.3, vn_hv_kv=20.0,
+            pp.create_transformer_from_parameters(random_net_lv, hv_bus, lv_bus, sn_mva=0.3, vn_hv_kv=20.0,
                                             vn_lv_kv=0.4, vkr_percent=0.993750, vk_percent=4.115529,
                                             pfe_kw=0.0, i0_percent=0.0, shift_degree=30,
                                             tap_pos=0.0, name=name)
@@ -95,14 +101,12 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
 
         # Add transformer from MV to LV
         create_cigre_lv_transformer(parent_bus, working_bus, f"{str(transformer_type)}_{branch_index}_Trafo", transformer_type)
-        graph.add_edge(parent_bus, working_bus)            
+        graph.add_edge(parent_bus, working_bus)    
+        graph[parent_bus][working_bus]['type'] = 'transformer'
                 
         #randomize how many forks this line will be
         Forks = random.randint(*LineForksRange)
-
-        #randomize the total length of the forks
-        Fork_Lengths = [random.randint(*ForkLengthRange) for _ in range(Forks)]
-
+        
         #randomize how many buses will be in this branch
         NumBuses = random.randint(*LineBusesRange)
         
@@ -111,20 +115,7 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
         remaining = NumBuses - Forks
         for _ in range(remaining):
             fork_bus_counts[random.randint(0, Forks - 1)] += 1
-
-        # For each fork, create a vector of random lengths whose sum is Fork_Lengths[i]
-        fork_hop_lengths = []
-        for i in range(Forks):
-            n_hops = fork_bus_counts[i] 
-            total_length = Fork_Lengths[i]
-            # Generate n_hops random positive numbers
-            if n_hops == 1:
-                fork_hop_lengths.append([total_length])
-            else:
-                cuts = sorted([random.uniform(0, total_length) for _ in range(n_hops - 1)])
-                hop_lengths = [cuts[0]] + [cuts[j] - cuts[j-1] for j in range(1, n_hops - 1)] + [total_length - cuts[-1]]
-                fork_hop_lengths.append(hop_lengths)
-
+        
         added_busses = []        
         
         # Create branches/forks       
@@ -135,10 +126,9 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
                 #create the bus
                 new_bus_name = f"{str(transformer_type)}_Branch{branch_index}_fork{f}bus{b}"
                 new_bus = pp.create_bus(current_net, name=new_bus_name, vn_kv=0.4, type='m', zone='CIGRE_LV')
-
-                #create a line connecting the parent bus to the child bus
-                pp.create_line(current_net, working_bus, new_bus, length_km=fork_hop_lengths[f][b], std_type='OH1', name=f'Line {net_cigre_lv.bus.at[working_bus, 'name']}-{net_cigre_lv.bus.at[new_bus, 'name']}')
-                graph.add_edge(working_bus, new_bus)                            
+                
+                graph.add_edge(working_bus, new_bus)  #the lines can only be created after all buses are positioned (only then I will know its lengths)                          
+                graph[working_bus][new_bus]['type'] = 'lv_line'
                 added_busses.append(new_bus)    
 
                 working_bus = new_bus
@@ -151,7 +141,7 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
                 working_bus = parent_bus    
             
             # Retrieve the parent_bus_name from net_cigre_lv
-            working_bus_name = net_cigre_lv.bus.at[parent_bus, 'name']
+            working_bus_name = random_net_lv.bus.at[parent_bus, 'name']
         
         return added_busses
 
@@ -159,15 +149,13 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
     Ct = random.randint(*CommercialRange)
     It = random.randint(*IndustrialRange)
     Rt = random.randint(*ResidencialRange)
-    
-    
 
     for i in range(Ct):
         new_lines = add_transformer_branch(
             transformer_type=NetworkType.COMMERCIAL,
             branch_index=i,
             parent_bus=mv_bus,
-            current_net= net_cigre_lv,
+            current_net= random_net_lv,
             graph=graph            
             )        
     for i in range(It):
@@ -175,7 +163,7 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
             transformer_type=NetworkType.INDUSTRIAL,
             branch_index=i,
             parent_bus=mv_bus,
-            current_net= net_cigre_lv,
+            current_net= random_net_lv,
             graph=graph                        
             )    
     for i in range(Rt):
@@ -183,22 +171,21 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
             transformer_type=NetworkType.RESIDENTIAL,
             branch_index=i,
             parent_bus=mv_bus,
-            current_net= net_cigre_lv,
+            current_net= random_net_lv,
             graph=graph                        
             )        
 
     success = generate_network_coordinates(
-        net=net_cigre_lv,
+        net=random_net_lv,
         root_bus_index=mv_bus,        
         graph=graph,
         min_distance_m=5,  # Minimum distance between points
         max_attempts=50  # Maximum attempts to place a point
-    )
-    
+    )    
     
     # Initialize bus_geodata if it doesn't exist
-    if net_cigre_lv.bus_geodata.empty:
-        net_cigre_lv.bus_geodata = pd.DataFrame(columns=['x', 'y'])
+    if random_net_lv.bus_geodata.empty:
+        random_net_lv.bus_geodata = pd.DataFrame(columns=['x', 'y'])
 
     for node in graph.nodes:
         # Get XY in graph
@@ -208,23 +195,38 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
         point_lat = distance(meters=node_coords.y).destination(mv_bus_coordinates, bearing=0).latitude
         point_lon = distance(meters=node_coords.x).destination(mv_bus_coordinates, bearing=0).longitude
 
-        final_point = GeopyPoint(point_lat, point_lon)
-        
+        final_point = GeopyPoint(point_lat, point_lon)        
 
         lat, lon = final_point.latitude, final_point.longitude
 
         #Update bus_geodata with local XY
-        net_cigre_lv.bus_geodata.loc[node, 'x'] = node_coords.x
-        net_cigre_lv.bus_geodata.loc[node, 'y'] = node_coords.y
+        random_net_lv.bus_geodata.loc[node, 'x'] = node_coords.x
+        random_net_lv.bus_geodata.loc[node, 'y'] = node_coords.y
 
         #update bus table with lat/lon
-        net_cigre_lv.bus.loc[node, 'lat'] = lat
-        net_cigre_lv.bus.loc[node, 'lon'] = lon
+        random_net_lv.bus.loc[node, 'lat'] = lat
+        random_net_lv.bus.loc[node, 'lon'] = lon
 
         #update graph node with latlon
         graph.nodes[node]['latlon'] = GeopyPoint(lat, lon)
 
-    return net_cigre_lv, graph
+    #now, use the graph to create the lines
+    for bus_u, bus_v in graph.edges:
+        # Compute Euclidean distance (assuming coordinates in meters)
+        length = graph.nodes[bus_u]['coordinates'].distance(graph.nodes[bus_v]['coordinates']) / 1000.0  #distance in km        
+
+        if graph[bus_u][bus_v]['type'] == 'lv_line':
+            # Create line in pandapower
+            pp.create_line(
+                random_net_lv,
+                from_bus=bus_u,
+                to_bus=bus_v,
+                length_km=length,
+                std_type="OH1",
+                name=f"Line {random_net_lv.bus.at[bus_u, 'name']}-{random_net_lv.bus.at[bus_v, 'name']}"
+            )
+
+    return random_net_lv, graph
 
 
 def arc_span(arc):
@@ -461,6 +463,19 @@ def randomize_position(vertex, graph, max_angle, max_distance):
     return p2prime,dp2.x,dp2.y,delta_r,delta_theta
     
  
+def build_multipoint_from_nodes(nodes, graph) -> ShapelyMultipoint:
+    """Create MultiPoint geometry from graph nodes"""
+    points = []
+    for node in nodes:
+        try:
+            coord = get_vertex_coordinate(node, graph)
+            if coord:
+                points.append(coord)
+        except KeyError:
+            continue
+    return ShapelyMultipoint(points) if points else ShapelyMultipoint()
+
+
 def build_multilines_from_edges(edges, graph):
     lines = []
     for src, dst in edges:        
@@ -480,6 +495,7 @@ def randomize_branch_positions(graph, vertex_to_randomize, max_trials=50):
     # Build geometries
     main_geom = build_multilines_from_edges(main_edges, graph)
     branch_geom = build_multilines_from_edges(branch_edges, graph)
+    node_branch_geom = build_multipoint_from_nodes(subtree_nodes, graph)
 
     # Current root position (for connection constraint)    
     parent_pos = get_vertex_coordinate(list(graph.predecessors(vertex_to_randomize))[0], graph) if list(graph.predecessors(vertex_to_randomize)) else ShapelyPoint(0, 0)    
@@ -493,17 +509,15 @@ def randomize_branch_positions(graph, vertex_to_randomize, max_trials=50):
         transformed_branch = affinity.rotate(branch_geom, math.degrees(dtheta), origin=parent_pos)
         transformed_branch = affinity.translate(transformed_branch, dx, dy)
 
+        node_transformed_branch = affinity.rotate(node_branch_geom, math.degrees(dtheta), origin=parent_pos)
+        node_transformed_branch = affinity.translate(node_transformed_branch, dx, dy)  # Buffer to avoid small overlaps
+
         #this is the new edge from parent to the randomized vertex
         connection_line = LineString([parent_pos, new_vertex_pos])
 
         # Check overlap
-        if transformed_branch.crosses(main_geom) or connection_line.crosses(main_geom):
-            continue  # Failed, try again
-
-        if vertex_to_randomize == 4:
-            breakpoint()
-
-        print(f'{vertex_to_randomize};{dtheta/math.pi*180};{dr}')
+        if transformed_branch.crosses(main_geom) or connection_line.crosses(main_geom) or node_transformed_branch.distance(main_geom) < 50.0:
+            continue  # Failed, try again        
         
         if len(original_coords) > 0: #if there is a subtree, rotate it
             # --- Vectorized rotation + translation ---
@@ -533,7 +547,7 @@ def randomize_branch_positions(graph, vertex_to_randomize, max_trials=50):
             for i, node in enumerate(subtree_nodes):
                 graph.nodes[node]['coordinates'] = new_coords[i]
 
-        graph.nodes[vertex_to_randomize]['coordinates'] = new_vertex_pos
+        graph.nodes[vertex_to_randomize]['coordinates'] = new_vertex_pos        
         return True
    
     return False
@@ -638,192 +652,15 @@ def generate_network_coordinates(net, root_bus_index, graph: nx.DiGraph, min_dis
 
                
         current_breadth = next_breadth
-        radius = radius + 100
-   
-    count = 0
-    #now randomize the positions of the branches
+        radius = radius + 100   
+    
+    #now randomize the positions of the branches and remove intermediate information
     for node in nx.bfs_tree(graph, root_bus_index):
+        for key in ['angle', 'radius', 'geometric_neighbors', 'arc_span']:
+            graph.nodes[node].pop(key, None)
         if node == root_bus_index:
             continue  # Skip the root        
-        randomize_branch_positions(graph, node)
-        count += 1
-     
+        randomize_branch_positions(graph, node, max_trials=max_attempts)
     
-    success = True #bfs(root_bus_index)    
+    success = True 
     return success, graph 
-
-def random_destination(origin_latlon, length_meters):
-    angle = random.uniform(0, 360)  # bearing in degrees
-    origin = GeopyPoint(origin_latlon[0], origin_latlon[1])
-    destination = distance(meters=length_meters).destination(origin, angle)
-    return (destination.latitude, destination.longitude)
-
-def smart_random_destination(origin_coordinate: ShapelyPoint, length_meters: float, line_index: STRtree, placed_points_index: STRtree, min_distance: float, grandpa_coordinate: ShapelyPoint = None, iterations:int=10):            
-    chosen_angle = None
-    
-    # Determine the central heading based on the grandpa_coordinate and origin_coordinate
-    central_heading_degrees = None
-    if grandpa_coordinate and not origin_coordinate.equals(grandpa_coordinate):
-        dy = origin_coordinate.y - grandpa_coordinate.y
-        dx = origin_coordinate.x - grandpa_coordinate.x
-        central_heading_degrees = math.degrees(math.atan2(dy, dx))
-    
-    # Define the allowed angle range (120 degrees) or 360 degrees if no heading
-    if central_heading_degrees is None:
-        # If no heading (e.g., for the first node), allow 360 degrees
-        angle_range_min = 0.0
-        angle_range_max = 360.0
-    else:
-        # Define a 120-degree cone relative to the central heading
-        angle_range_min = central_heading_degrees - 60.0
-        angle_range_max = central_heading_degrees + 60.0
-
-    # Helper function to navigate from an origin point given an angle and length
-    def navigate_to(origin_coordinate: ShapelyPoint, angle, length_meters):
-        angle_rad = math.radians(angle)
-        dx = length_meters * math.cos(angle_rad)
-        dy = length_meters * math.sin(angle_rad)            
-        return ShapelyPoint(origin_coordinate.x + dx, origin_coordinate.y + dy)
-
-    for i in range(iterations):
-        if chosen_angle is not None:
-            break
-        
-        num_candidates = 2 ** i
-        if num_candidates == 0: # Ensure at least one candidate for i=0
-            num_candidates = 1
-        angle_step = (angle_range_max - angle_range_min) / num_candidates
-        angle_offset = random.uniform(-angle_step / 2, angle_step / 2)  # Randomize within the step
-
-        angles_to_try = []
-        for j in range(num_candidates):
-            # Linearly distribute angles within the calculated range
-            angle = angle_offset + angle_range_min + j*angle_step
-            angles_to_try.append(angle) # Normalize to 0-360 degrees
-
-        random.shuffle(angles_to_try) # Randomize the order to try candidates
-
-        for dest_angle in angles_to_try:
-            dest_coordinate = navigate_to(origin_coordinate, dest_angle, length_meters)            
-            if fast_is_valid_placement(dest_coordinate, origin_coordinate, placed_points_index, line_index, min_distance):
-                chosen_angle = dest_angle
-                break       
-    
-    if chosen_angle is not None:
-        print(f"Angle chosen: {chosen_angle} degrees after {i+1} iterations")
-        return navigate_to(origin_coordinate, chosen_angle, length_meters)
-    else:
-        return None  # No valid destination found after all iterations
-
-def is_valid_placement(new_point, from_point, placed_points, lines, min_distance):
-    for pt in placed_points.values():
-        if new_point.distance(pt) < min_distance:
-            return False
-    new_line = LineString([from_point[::-1], new_point[::-1]])  # lon, lat for shapely
-    for l in lines:
-            if l.intersects(new_line):
-                intersection = l.intersection(new_line)
-                # If the intersection is a Point and it's at the endpoints of both lines
-                if isinstance(intersection, ShapelyPoint):
-                    if intersection.equals(ShapelyPoint(l.coords[0])) or intersection.equals(ShapelyPoint(l.coords[-1])):
-                        if intersection.equals(ShapelyPoint(new_line.coords[0])) or intersection.equals(ShapelyPoint(new_line.coords[-1])):
-                            # intersection is just at the origin/endpoints of both lines → allow it
-                            continue
-                return False
-    return True
-
-def fast_is_valid_placement(new_point: ShapelyPoint, from_point: ShapelyPoint, placed_points_index: STRtree, lines_index: STRtree , min_distance: float) -> bool:       
-    """
-    Checks if a new point and the line connecting it to a 'from_point' can be placed
-    without violating minimum distance constraints to existing points and lines.
-
-    Parameters:
-    - new_point (ShapelyPoint): The potential new point to place.
-    - from_point (ShapelyPoint): The point from which the new_point originates (forms a line).
-    - placed_points_index (STRtree): Spatial index of already placed ShapelyPoint objects.
-    - lines_index (STRtree): Spatial index of already placed LineString objects.
-    - min_distance (float): The minimum allowable distance between geometries.
-
-    Returns:
-    - bool: True if the placement is valid, False otherwise.
-    """
-
-    # 1. Check point-to-point distance
-    if placed_points_index is not None:
-        # Query for points within min_distance of new_point
-        nearby_points = placed_points_index.query(new_point.buffer(min_distance))
-        for pt_idx in nearby_points:
-            pt = placed_points_index.geometries[pt_idx]
-            # Ensure the new point isn't too close to existing points, excluding the 'from_point'
-            # if from_point is one of the existing points that created the STRtree.
-            # We also ensure it's not the exact same point.
-            if new_point.distance(pt) < min_distance and not new_point.equals(pt):
-                return False
-
-    # 2. Check new point to existing lines distance
-    if lines_index is not None:
-        # Create a buffer around the new_point to check for proximity to lines
-        buffered_new_point = new_point.buffer(min_distance)
-        
-        # Query for lines within the bounding box of the buffered new point
-        nearby_lines_indices = lines_index.query(buffered_new_point)
-        
-        for l_index in nearby_lines_indices:
-            existing_line = lines_index.geometries[l_index]
-            
-            # Check if the buffered new point intersects with any existing line
-            if buffered_new_point.intersects(existing_line):
-                # We need to make sure this intersection isn't just because the 'from_point'
-                # is connected to this 'existing_line'.
-                # If the new point is being placed *on* the `from_point`, that's invalid if `from_point` is part of an existing line
-                # (unless it's an endpoint).
-                
-                # Check if the existing line contains the 'from_point' AND the 'new_point' is distinct from 'from_point'
-                # and not coincident with any of the existing line's endpoints.
-                if existing_line.distance(new_point) < min_distance:
-                    # If the existing line's buffer does not contain the from_point, then the
-                    # new point is too close to an existing line that it's not directly connected to.
-                    # Or, if it is connected through from_point, we need to ensure new_point
-                    # is not too close to the line itself.
-                    # We also want to exclude the case where the new point is just the 'from_point'
-                    # and that 'from_point' is an endpoint of the existing line.
-                    
-                    # More robust check: if the new point is too close to the existing line,
-                    # AND it's not the line that connects directly to the 'from_point',
-                    # AND the new point is not an endpoint of that existing line.
-                    
-                    is_endpoint_of_existing_line = (new_point.equals(ShapelyPoint(existing_line.coords[0])) or new_point.equals(ShapelyPoint(existing_line.coords[-1])))
-                    
-                    # The line being considered for connection (from_point to new_point)
-                    potential_new_line = LineString([from_point, new_point])
-
-                    # If the existing line is the one we are creating right now (which shouldn't happen with proper indexing),
-                    # or if the new point is too close to an existing line that it's not a direct endpoint of.
-                    if not is_endpoint_of_existing_line and not potential_new_line.equals(existing_line):
-                        # If new_point is too close to an existing line, and it's not a common endpoint
-                        # and it's not the line being currently built.
-                        return False
-
-    # 3. Check new line (from_point to new_point) intersection with existing lines (not proximity)
-    new_line = LineString([from_point, new_point])
-
-    if lines_index is not None:
-        nearby_lines_indices = lines_index.query(new_line)
-        for l_index in nearby_lines_indices:
-            existing_line = lines_index.geometries[l_index]
-            if new_line.equals(existing_line):
-                continue
-            if new_line.intersects(existing_line):
-                intersection = new_line.intersection(existing_line)
-                # Allow intersection only if it's exactly at a common endpoint of the *unbuffered* lines
-                if isinstance(intersection, ShapelyPoint):
-                    is_endpoint_of_newline = (intersection.equals(from_point) or intersection.equals(new_point))
-                    is_endpoint_of_existingline = (
-                        intersection.equals(ShapelyPoint(existing_line.coords[0])) or
-                        intersection.equals(ShapelyPoint(existing_line.coords[-1]))
-                    )
-                    if is_endpoint_of_newline and is_endpoint_of_existingline:
-                        continue
-                return False
-
-    return True  # No invalid intersections found
