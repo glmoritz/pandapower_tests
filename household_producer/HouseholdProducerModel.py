@@ -300,7 +300,7 @@ class HouseholdProducerModel(mosaik_api.Simulator):
             pv_generation_mwh   = entity.get('PVGeneration[MWh]', 0.0) + 0.5*((pv_mw-pv_curtail_mw)+(entity.get('last_pv_generation_power_mw', 0.0)-results[eid].get('Curtailment[MW]', 0.0))) * step_hours
             energy_consumption_mwh   = entity.get('EnergyConsumption[MWh]', 0.0) + 0.5*(load_mw+entity.get('last_load_power_mw', 0.0)) * step_hours
 
-            results[eid] = {                
+            results[eid].update({                
                 'SOC[MWh]':        soc_mwh,
                 'SOC[%]':          soc_percent,
                 'Curtailment[MW]': pv_curtail_mw,                
@@ -309,14 +309,14 @@ class HouseholdProducerModel(mosaik_api.Simulator):
                 'CurtailmentEnergy[MWh]':cultailment_energy_mwh,
                 'PVGeneration[MWh]': pv_generation_mwh,
                 'EnergyConsumption[MWh]': energy_consumption_mwh,
-            }  
+            })  
 
             entity['last_pv_generation_power_mw'] = pv_mw    
             entity['last_load_power_mw'] = load_mw                
             
         # Keep a snapshot for get_data()
         self.results = results
-        return next_time, next_max_adv
+        return time+self.time_step 
 
 
     def get_data(self, outputs):

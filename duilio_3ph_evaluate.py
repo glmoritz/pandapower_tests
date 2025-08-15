@@ -15,7 +15,7 @@ import os
 import networkx as nx
 import pandapower.networks as pn
 from simulation_worker.SimulationWorker import find_and_lock_param_file
-from create_random_network import generate_pandapower_net
+from create_random_network import generate_pandapower_net, load_network_from_database, save_network_to_database
 import time
 import random
 from pandapower.create import create_load
@@ -35,11 +35,9 @@ house_module_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'hou
 if house_module_path not in sys.path:
     sys.path.insert(0, house_module_path)
 
-postgres_module_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'postgres_reader_model'))
+postgres_module_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'postgres_model'))
 if postgres_module_path not in sys.path:
     sys.path.insert(0, postgres_module_path)
-
-
 
 import irradiation_model
 
@@ -75,25 +73,65 @@ def run_simulation(params):
             'python': 'household_producer.HouseholdProducerModel:HouseholdProducerModel'
         },
         'PostgresReaderModel': {
-            'python': 'postgres_reader_model.PostgresReaderModel:PostgresReaderModel'
+            'python': 'postgres_model.PostgresReaderModel:PostgresReaderModel'
+        },
+        'PostgresWriterModel': {
+            'python': 'postgres_model.PostgresWriterModel:PostgresWriterModel'
         }
     }    
 
     world = mosaik.World(SIM_CONFIG)
 
-    net, graph = generate_pandapower_net(
-        CommercialRange=params['commercial_range'],
-        IndustrialRange=params['industrial_range'],
-        ResidencialRange=params['residential_range'],
-        ForkLengthRange=params['fork_length_range'],
-        LineBusesRange=params['line_buses_range'],
-        LineForksRange=params['line_forks_range'],
-        mv_bus_coordinates=(float(params['mv_bus_latitude']),float(params['mv_bus_longitude']))
-    )
+    db = {
+        "dbname": "duilio",
+        "user": "root",
+        "password": "skamasfrevrest",
+        "host": "103.0.1.37",
+        "port": 5433  # or your port
+    }
+
+    net, graph = None, None
+    if params['use_saved_network_if_exists']:
+        try:
+            net, graph = load_network_from_database(db, params['network_id'])
+            print(f"Loaded existing network '{params['network_id']}' from database.")
+        except Exception as e:
+            print(f"Network '{params['network_id']} does not exists': {e}")
+            net, graph = None, None
+    
+    if net is None or graph is None:
+        net, graph = generate_pandapower_net(
+            CommercialRange=params['commercial_range'],
+            IndustrialRange=params['industrial_range'],
+            ResidencialRange=params['residential_range'],
+            ForkLengthRange=params['fork_length_range'],
+            LineBusesRange=params['line_buses_range'],
+            LineForksRange=params['line_forks_range'],
+            mv_bus_coordinates=(float(params['mv_bus_latitude']),float(params['mv_bus_longitude']))
+        )
+        net.ext_grid['r0x0_max'] = 5.0
+        net.ext_grid['x0x_max'] = 5.0
+
+        # Add a new column to the net.line DataFrame
+        net.line['r0_ohm_per_km'] = net.line['r_ohm_per_km'] * 3
+        net.line['x0_ohm_per_km'] = net.line['x_ohm_per_km'] * 3
+        net.line['c0_nf_per_km'] = net.line['c_nf_per_km'] * 3
+        net.trafo['vector_group'] = 'Dyn'
+        net.trafo['vk0_percent'] = net.trafo['vk_percent']
+        net.trafo['mag0_percent'] = 100
+        net.trafo['mag0_rx'] = 0 
+        net.trafo['si0_hv_partial'] = 0.9
+        net.trafo['vkr0_percent'] = net.trafo['vkr_percent']   
+        save_network_to_database(
+            graph = graph,
+            net= net,
+            db_connection = db,
+            grid_name = params['network_id'])             
+        print(f"Saved new network '{params['network_id']}' to database.")
 
     # Power data output to test
-    csv_sim_writer = world.start('CSV_writer', start_date = params['start_time'], output_file=f'{params['results_dir']}/{params['output_file']}')
-    csv_writer = csv_sim_writer.CSVWriter(buff_size = params['step_size_s'])
+    #csv_sim_writer = world.start('CSV_writer', start_date = params['start_time'], output_file=f'{params['results_dir']}/{params['output_file']}')
+    #csv_writer = csv_sim_writer.CSVWriter(buff_size = int(params['step_size_s']))
 
     # Create PV system with certain configuration
     pv_sim = world.start(
@@ -124,18 +162,11 @@ def run_simulation(params):
     #Instantiate the power network    
     pp_sim = world.start("Pandapower", step_size=int(params['step_size_s']), asymmetric_flow=True)
  
-    #Power Consumption Model
-    db = {
-        "dbname": "duilio",
-        "user": "root",
-        "password": "skamasfrevrest",
-        "host": "103.0.1.37",
-        "port": 5433  # or your port
-    }
+    #Power Consumption Model    
     sim_start_dt = datetime.strptime(params['start_time'], '%Y-%m-%d %H:%M:%S')
     sim_end_dt = sim_start_dt + timedelta(seconds=float(params['simulation_time_s']))
     power_consumption_sim = world.start(  "PostgresReaderModel",                                         
-                                            time_resolution=int(params['step_size_s']),     
+                                            time_resolution=1,     
                                             time_step=int(params['step_size_s']),
                                             sim_start=params['start_time'],
                                             sim_end=sim_end_dt.strftime('%Y-%m-%d %H:%M:%S'),
@@ -144,21 +175,19 @@ def run_simulation(params):
                                             date_format='%Y-%m-%d %H:%M:%S',
                                             type="time-based")                                          
 
+    result_output_model = world.start("PostgresWriterModel",                                                                                     
+                                            start_date=params['start_time'],                                            
+                                            db_connection=db,                                                                                                                                    
+                                            write_to_db=True,
+                                            simulation_params=params,
+                                            output_csv=True,
+                                            output_file=f'{params['results_dir']}/{params['output_file']}',
+                                            time_resolution=1)                                              
+    result_writer = result_output_model.PostgresWriterModel(buff_size=int(params['step_size_s']))
+
     grid = pp_sim.Grid(net=net)
 
-    net.ext_grid['r0x0_max'] = 5.0
-    net.ext_grid['x0x_max'] = 5.0
-
-    # Add a new column to the net.line DataFrame
-    net.line['r0_ohm_per_km'] = net.line['r_ohm_per_km'] * 3
-    net.line['x0_ohm_per_km'] = net.line['x_ohm_per_km'] * 3
-    net.line['c0_nf_per_km'] = net.line['c_nf_per_km'] * 3
-    net.trafo['vector_group'] = 'Dyn'
-    net.trafo['vk0_percent'] = net.trafo['vk_percent']
-    net.trafo['mag0_percent'] = 100
-    net.trafo['mag0_rx'] = 0 
-    net.trafo['si0_hv_partial'] = 0.9
-    net.trafo['vkr0_percent'] = net.trafo['vkr_percent']
+    
     extra_info = pp_sim.get_extra_info()
     loads = [e for e in grid.children if e.type == "Load"]    
     buses = [e for e in grid.children if e.type == "Bus"] 
@@ -168,29 +197,29 @@ def run_simulation(params):
 
     #output load Powers
     for load in loads:
-        world.connect(load, csv_writer, "P[MW]")
+        world.connect(load, result_writer, "P[MW]")
 
     #output bus powers
     for bus in buses:
-        world.connect(bus, csv_writer, "P_a[MW]")    
-        world.connect(bus, csv_writer, "Vm_a[pu]")
-        world.connect(bus, csv_writer, "P_b[MW]")    
-        world.connect(bus, csv_writer, "Vm_b[pu]")
-        world.connect(bus, csv_writer, "P_c[MW]")    
-        world.connect(bus, csv_writer, "Vm_c[pu]")
+        world.connect(bus, result_writer, "P_a[MW]")    
+        world.connect(bus, result_writer, "Vm_a[pu]")
+        world.connect(bus, result_writer, "P_b[MW]")    
+        world.connect(bus, result_writer, "Vm_b[pu]")
+        world.connect(bus, result_writer, "P_c[MW]")    
+        world.connect(bus, result_writer, "Vm_c[pu]")        
         graph.nodes[bus.extra_info['index']]['bus_element'] = bus
         
     for trafo in trafos:
-        world.connect(trafo, csv_writer, "Loading[%]")  
+        world.connect(trafo, result_writer, "Loading[%]")  
 
     #output line information
     for line in lines:
-        world.connect(line, csv_writer, "I_a_from[kA]")
-        world.connect(line, csv_writer, "I_b_from[kA]")
-        world.connect(line, csv_writer, "I_c_from[kA]")
-        world.connect(line, csv_writer, "Pl_a[MW]")
-        world.connect(line, csv_writer, "Pl_b[MW]")
-        world.connect(line, csv_writer, "Pl_c[MW]")
+        world.connect(line, result_writer, "I_a_from[kA]")
+        world.connect(line, result_writer, "I_b_from[kA]")
+        world.connect(line, result_writer, "I_c_from[kA]")
+        world.connect(line, result_writer, "Pl_a[MW]")
+        world.connect(line, result_writer, "Pl_b[MW]")
+        world.connect(line, result_writer, "Pl_c[MW]")
         
         #world.connect(line, csv_writer, "Pin[MW]")
         # world.connect(line, csv_writer, "Pout[MW]")
@@ -285,7 +314,7 @@ def run_simulation(params):
                                             )
             
             #connect the irradiance model to the household model
-            world.connect(irradiation_model, csv_writer, "DNI[W/m2]")
+            world.connect(irradiation_model, result_writer, "DNI[W/m2]")
             world.connect(irradiation_model, house_model, ("DNI[W/m2]","Irradiance[W/m2]"))
 
             #connect the household inverter to the bus (in random phases)
@@ -324,28 +353,33 @@ def run_simulation(params):
 
             #now execute a query to find buildings that have split_loads[i] as average power consumption
             sql = """
-                    WITH targets(avg_power) AS (
-                        SELECT unnest(%s::float8[])  -- List of target average powers
-                    ), candidate_buildings AS (
-                        SELECT 
-                            bldg_id,
-                            AVG(electricity_total_energy_consumption) / 24 AS avg_daily_power_kw
-                        FROM building_power.daily_energy
-                        WHERE electricity_total_energy_consumption IS NOT NULL
-                        AND \"day\" >= %s
-                        AND \"day\" <= %s
-                        GROUP BY bldg_id
-                    )
+                    WITH targets(avg_power) AS 
+                    (
+                        SELECT unnest(%s::float8[])
+                    ), 
+                    candidate_buildings AS 
+                    (
+                    SELECT 
+                        bldg_id,
+                        -- Convert kWh to kW by dividing by time fraction (0.25 for 15min intervals)
+                        -- Then average these power values over the period
+                        AVG(electricity_total_energy_consumption / 0.25) AS avg_power_kw
+                    FROM building_power.building_power
+                    WHERE electricity_total_energy_consumption IS NOT NULL
+                    AND sample_time >= %s
+                    AND sample_time <= %s
+                    GROUP BY bldg_id
+                    ) 
                     SELECT DISTINCT ON (t.avg_power) 
                         cb.bldg_id,
-                        t.avg_power,                        
-                        cb.avg_daily_power_kw,
-                        ABS(cb.avg_daily_power_kw - t.avg_power) AS deviation_kw
-                    FROM targets t
-                    JOIN candidate_buildings cb 
-                        ON ABS(cb.avg_daily_power_kw - t.avg_power) <= %s
+                        t.avg_power, 
+                        cb.avg_power_kw, 
+                        ABS(cb.avg_power_kw - t.avg_power) AS deviation_kw 
+                        FROM targets t 
+                        JOIN candidate_buildings cb 
+                        ON ABS(cb.avg_power_kw - t.avg_power) <= %s
                     ORDER BY t.avg_power, random(), deviation_kw;
-                    """            
+                  """            
 
             with psycopg2.connect(**db) as conn:
                 with conn.cursor() as cur:
