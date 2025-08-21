@@ -84,8 +84,11 @@ WITH NO DATA;
 CREATE TABLE building_power.simulation_outputs (
     simulation_output_id SERIAL PRIMARY KEY,
     started_at TIMESTAMPTZ DEFAULT now(),
-    parameters JSONB NOT NULL
+	parameters JSONB NOT NULL,
+	pandapower_grid_id BIGINT REFERENCES building_power.pandapower_grids(grid_id) ON DELETE SET NULL
 );
+
+CREATE INDEX idx_simulation_outputs_metadata ON building_power.simulation_outputs USING gin (parameters jsonb_path_ops);
 
 --------------------------------------------------------------------------------
 -- 2. VARIABLE METADATA

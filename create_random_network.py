@@ -26,6 +26,81 @@ class NetworkType(Enum):
     INDUSTRIAL = "industrial"
     RESIDENTIAL = "residential"
 
+def update_network_metadata_to_database(graph: nx.Graph, net, db_connection, grid_name):
+    conn = psycopg2.connect(**db_connection)
+    cur = conn.cursor()
+    grid_catalogue_name = 'pandapower_grids'
+    
+    # Create a custom JSON encoder for complex objects
+    class CustomJSONEncoder(json.JSONEncoder):
+        def default(self, o):
+            # Handle shapely geometry objects
+            if hasattr(o, '__geo_interface__'):
+                return {"_shapely_wkt": o.wkt}
+            
+            # Handle GeopyPoint objects
+            if isinstance(o, GeopyPoint):
+                return {"_geopy_point": {"latitude": o.latitude, "longitude": o.longitude}}
+                
+            # Let the base class default method raise the TypeError
+            return json.JSONEncoder.default(self, o)
+    
+    try:
+        
+        # Step 1: Create or get network record
+        cur.execute(f"""
+            SELECT grid_id from building_power.{grid_catalogue_name} WHERE grid_name = %s            
+        """,
+          (
+            grid_name, 
+            )
+        )
+
+        if cur is not None:        
+            pandapower_grid_id = cur.fetchone()        
+            if pandapower_grid_id is None:
+                raise Exception(f"Network '{grid_name}' does not exist in the database, cannot update metadata.")        
+        
+        
+        # Step 3: update vertices using pandapower bus index as the key
+        for node, attrs in graph.nodes(data=True):            
+            metadata = dict(attrs)
+            
+            # Serialize complex objects in metadata
+            metadata_json = json.dumps(metadata, cls=CustomJSONEncoder)
+            
+            cur.execute("""
+                UPDATE building_power.network_vertices
+                SET vertix_metadata = %s
+                WHERE pandapower_grid_id = %s AND pandapower_bus_index = %s;
+            """, (metadata_json, pandapower_grid_id, int(node)))
+
+        # Step 4: update edges
+        for u, v, attrs in graph.edges(data=True):
+            edge_metadata = json.dumps(attrs, cls=CustomJSONEncoder)
+            cur.execute("""
+                UPDATE building_power.network_edges
+                SET edge_metadata = %s
+                WHERE pandapower_grid_id = %s AND source_pandapower_bus_index = %s AND target_pandapower_bus_index = %s;
+            """, (
+                edge_metadata,
+                pandapower_grid_id,
+                int(u),
+                int(v)
+            ))
+        
+        conn.commit()
+        print(f"Updated network '{grid_name}' with grid_id={pandapower_grid_id}")
+        return pandapower_grid_id
+        
+    except Exception as e:
+        conn.rollback()
+        print(f"Failed to save network: {e}")
+        raise
+    finally:
+        cur.close()
+        conn.close()
+
 def save_network_to_database(graph: nx.Graph, net, db_connection, grid_name):
     conn = psycopg2.connect(**db_connection)
     cur = conn.cursor()
@@ -141,33 +216,42 @@ def save_network_to_database(graph: nx.Graph, net, db_connection, grid_name):
 def load_network_from_database(db_connection, network_name):
     conn = psycopg2.connect(**db_connection)
     cur = conn.cursor()
-    
+    grid_catalogue_name = 'pandapower_grids'
+
     # Create a custom JSON decoder for complex objects
     def custom_object_hook(obj):
-        # Handle shapely geometry objects
-        if "_shapely_wkt" in obj:
-            return wkt.loads(obj["_shapely_wkt"])
-        
-        # Handle GeopyPoint objects
-        if "_geopy_point" in obj:
-            point_data = obj["_geopy_point"]
-            return GeopyPoint(point_data["latitude"], point_data["longitude"])
+        if isinstance(obj, dict):
+            # Handle shapely geometry objects
+            if "_shapely_wkt" in obj:
+                return wkt.loads(obj["_shapely_wkt"])
             
-        # All other objects pass through
+            # Handle GeopyPoint objects
+            elif "_geopy_point" in obj:
+                point_data = obj["_geopy_point"]
+                return GeopyPoint(point_data["latitude"], point_data["longitude"])
+            
+            # Process nested dictionaries
+            return {k: custom_object_hook(v) for k, v in obj.items()}
+        
+        # Handle lists
+        elif isinstance(obj, list):
+            return [custom_object_hook(item) for item in obj]
+        
+        # All other objects pass through unchanged
         return obj
 
     try:
         # Step 1: Get network_id from network name
-        cur.execute("""
-            SELECT network_id FROM building_power.networks
-            WHERE network_name = %s;
+        cur.execute(f"""
+            SELECT grid_id FROM building_power.{grid_catalogue_name}
+            WHERE grid_name = %s;
         """, (network_name,))
         
         result = cur.fetchone()
         if result is None:
             raise Exception(f"Network '{network_name}' not found")
         
-        network_id = result[0]
+        pandapower_grid_id = result[0]
         
         # Step 2: Load graph structure from our network tables
         graph = nx.DiGraph()
@@ -178,11 +262,11 @@ def load_network_from_database(db_connection, network_name):
             FROM building_power.network_vertices 
             WHERE pandapower_grid_id = %s
             ORDER BY pandapower_bus_index;
-        """, (network_id,))
+        """, (pandapower_grid_id,))
         
         for bus_index, label, metadata_json in cur.fetchall():
             # Use the custom decoder to parse the JSON
-            metadata = json.loads(metadata_json, object_hook=custom_object_hook)
+            metadata = custom_object_hook(metadata_json)
             node_attrs = dict(metadata)
             if label is not None:
                 node_attrs["name"] = label
@@ -192,25 +276,24 @@ def load_network_from_database(db_connection, network_name):
         cur.execute("""
             SELECT source_pandapower_bus_index, target_pandapower_bus_index, directed, edge_metadata 
             FROM building_power.network_edges 
-            WHERE network_id = %s;
-        """, (network_id,))
+            WHERE pandapower_grid_id = %s;
+        """, (pandapower_grid_id,))
         
         for source_bus, target_bus, is_directed, metadata_json in cur.fetchall():
             # Use the custom decoder to parse the JSON
-            metadata = json.loads(metadata_json, object_hook=custom_object_hook) if metadata_json else {}
+            metadata = custom_object_hook(metadata_json)
             graph.add_edge(source_bus, target_bus, **metadata)
             if not is_directed:
                 graph.add_edge(target_bus, source_bus, **metadata)
 
-        # Step 3: Load the pandapower network
+        # Step3: Load the pandapower network
         grid_catalogue_name = 'pandapower_grids'
         
         # Get the grid_id for this network
         cur.execute(f"""
             SELECT grid_id FROM building_power.{grid_catalogue_name}
-            WHERE network_id = %s OR grid_name = %s
-            ORDER BY grid_id DESC LIMIT 1;
-        """, (network_id, network_name))
+            WHERE grid_name = %s;
+        """, (network_name,))
         
         grid_result = cur.fetchone()
         if grid_result is None:
@@ -226,447 +309,14 @@ def load_network_from_database(db_connection, network_name):
                     )
         
         print(f"Loaded network '{network_name}' with {len(graph.nodes)} buses and {len(graph.edges)} connections")
-        return pandapower_grid, graph
-        
+        return pandapower_grid_id, pandapower_grid, graph
+            
     except Exception as e:
         print(f"Failed to load network: {e}")
         raise
     finally:
         cur.close()
         conn.close()
-
-def list_networks_in_database(db_connection):
-    """
-    List all available networks in the database.
-    
-    Returns:
-        pandas.DataFrame: DataFrame with network information
-    """
-    conn = psycopg2.connect(**db_connection)
-    cur = conn.cursor()
-    
-    try:
-        cur.execute("""
-            SELECT 
-                n.network_id,
-                n.network_name,
-                n.network_description,
-                n.created_at,
-                n.network_metadata,
-                COUNT(v.pandapower_bus_index) as vertex_count,
-                COUNT(e.network_edge_id) as edge_count
-            FROM building_power.networks n
-            LEFT JOIN building_power.network_vertices v ON n.network_id = v.network_id
-            LEFT JOIN building_power.network_edges e ON n.network_id = e.network_id
-            GROUP BY n.network_id, n.network_name, n.network_description, n.created_at, n.network_metadata
-            ORDER BY n.created_at DESC;
-        """)
-        
-        columns = ['network_id', 'network_name', 'network_description', 'created_at', 'network_metadata', 'vertex_count', 'edge_count']
-        results = cur.fetchall()
-        
-        if results:
-            df = pd.DataFrame(results, columns=columns)
-            return df
-        else:
-            return pd.DataFrame(columns=columns)
-            
-    except Exception as e:
-        print(f"Failed to list networks: {e}")
-        raise
-    finally:
-        cur.close()
-        conn.close()
-
-def delete_network_from_database(db_connection, network_name):
-    """
-    Delete a network and all its associated data from the database.
-    
-    Args:
-        db_connection: Database connection parameters
-        network_name: Name of the network to delete
-        
-    Returns:
-        bool: True if deletion was successful
-    """
-    conn = psycopg2.connect(**db_connection)
-    cur = conn.cursor()
-    
-    try:
-        # Get network_id
-        cur.execute("""
-            SELECT network_id FROM building_power.networks
-            WHERE network_name = %s;
-        """, (network_name,))
-        
-        result = cur.fetchone()
-        if result is None:
-            print(f"✗ Network '{network_name}' not found")
-            return False
-        
-        network_id = result[0]
-        
-        # Delete from networks table (CASCADE will handle vertices and edges)
-        cur.execute("DELETE FROM building_power.networks WHERE network_id = %s", (network_id,))
-        
-        # Also delete the pandapower network if it exists
-        cur.execute("""
-            DELETE FROM building_power.pandapower_networks 
-            WHERE network_id = %s OR grid_name = %s;
-        """, (network_id, network_name))
-        
-        conn.commit()
-        print(f"Deleted network '{network_name}' and all associated data")
-        return True
-        
-    except Exception as e:
-        conn.rollback()
-        print(f"Failed to delete network: {e}")
-        return False
-    finally:
-        cur.close()
-        conn.close()
-
-def generate_pandapower_net_from_graph(graph: nx.DiGraph, mv_bus_index,
-                            mv_bus_coordinates=(0.0, 0.0)
-                            ):    
-    
-    random_net_lv = pp.create_empty_network()
-
-    # Linedata
-    # UG1
-    line_data = {'c_nf_per_km': 0.0, 'r_ohm_per_km': 0.162,
-                 'x_ohm_per_km': 0.0832, 'max_i_ka': 1.0,
-                 'type': 'cs'}
-    pp.create_std_type(random_net_lv, line_data, name='UG1', element='line')
-
-    # UG2
-    line_data = {'c_nf_per_km': 0.0, 'r_ohm_per_km': 0.2647,
-                 'x_ohm_per_km': 0.0823, 'max_i_ka': 1.0,
-                 'type': 'cs'}
-    pp.create_std_type(random_net_lv, line_data, name='UG2', element='line')
-
-    # UG3
-    line_data = {'c_nf_per_km': 0.0, 'r_ohm_per_km': 0.822,
-                 'x_ohm_per_km': 0.0847, 'max_i_ka': 1.0,
-                 'type': 'cs'}
-    pp.create_std_type(random_net_lv, line_data, name='UG3', element='line')
-
-    # OH1
-    line_data = {'c_nf_per_km': 0.0, 'r_ohm_per_km': 0.4917,
-                 'x_ohm_per_km': 0.2847, 'max_i_ka': 1.0,
-                 'type': 'ol'}
-    pp.create_std_type(random_net_lv, line_data, name='OH1', element='line')
-
-    # OH2
-    line_data = {'c_nf_per_km': 0.0, 'r_ohm_per_km': 1.3207,
-                 'x_ohm_per_km': 0.321, 'max_i_ka': 1.0,
-                 'type': 'ol'}
-    pp.create_std_type(random_net_lv, line_data, name='OH2', element='line')
-
-    # OH3
-    line_data = {'c_nf_per_km': 0.0, 'r_ohm_per_km': 2.0167,
-                 'x_ohm_per_km': 0.3343, 'max_i_ka': 1.0,
-                 'type': 'ol'}
-    pp.create_std_type(random_net_lv, line_data, name='OH3', element='line')
-
-    # Add the main 20 kV bus (medium voltage)
-    mv_bus = pp.create_bus(random_net_lv, 
-                           name=graph.nodes[mv_bus_index]['name'], 
-                           vn_kv=graph.nodes[mv_bus_index]['vn_kv'],
-                           type=graph.nodes[mv_bus_index]['type'],
-                           zone=graph.nodes[mv_bus_index]['zone'])
-    graph.nodes[mv_bus_index]['pp_bus'] = mv_bus
-
-    # External grid
-    pp.create_ext_grid(random_net_lv, mv_bus, vm_pu=1.0, va_degree=0.0, s_sc_max_mva=100.0,
-                    s_sc_min_mva=100.0, rx_max=1.0, rx_min=1.0)
-
-    def create_cigre_lv_transformer(net, hv_bus, lv_bus, name, transformer_type):
-        if transformer_type == str(NetworkType.RESIDENTIAL):
-            pp.create_transformer_from_parameters(net, hv_bus, lv_bus, sn_mva=0.5, vn_hv_kv=20.0,
-                                       vn_lv_kv=0.4, vkr_percent=1.0, vk_percent=4.123106,
-                                       pfe_kw=0.0, i0_percent=0.0, shift_degree=30,
-                                       tap_pos=0.0, name=name)
-        elif transformer_type == str(NetworkType.INDUSTRIAL):
-            pp.create_transformer_from_parameters(net, hv_bus, lv_bus, sn_mva=0.15, vn_hv_kv=20.0,
-                                            vn_lv_kv=0.4, vkr_percent=1.003125, vk_percent=4.126896,
-                                            pfe_kw=0.0, i0_percent=0.0, shift_degree=30,
-                                            tap_pos=0.0, name=name)
-        elif transformer_type == str(NetworkType.COMMERCIAL):
-            pp.create_transformer_from_parameters(net, hv_bus, lv_bus, sn_mva=0.3, vn_hv_kv=20.0,
-                                            vn_lv_kv=0.4, vkr_percent=0.993750, vk_percent=4.115529,
-                                            pfe_kw=0.0, i0_percent=0.0, shift_degree=30,
-                                            tap_pos=0.0, name=name)
-            
-    # Traverse the graph and create a pandapower bus for each vertex except the MV bus
-    for node in graph.nodes:
-        if node == mv_bus_index:
-            continue  # MV bus already created
-        new_bus_name = graph.nodes[node].get('name', f"Bus_{node}")
-        bus_id = pp.create_bus(
-            random_net_lv,
-            name=new_bus_name,
-            vn_kv=graph.nodes[node].get('vn_kv', 0.4),
-            type=graph.nodes[node].get('type', 'm'),
-            zone=graph.nodes[node].get('zone', 'CIGRE_LV')
-        )
-        # Store the mapping from graph node to pandapower bus index
-        graph.nodes[node]['pp_bus'] = bus_id
-        
-    
-    # Initialize bus_geodata if it doesn't exist
-    if random_net_lv.bus_geodata.empty:
-        random_net_lv.bus_geodata = pd.DataFrame(columns=['x', 'y'])
-
-    for node in graph.nodes:
-        # Get XY in graph
-        node_coords = graph.nodes[node]['coordinates']
-        
-        # Convert XY offset into lat/lon
-        point_lat = distance(meters=node_coords.y).destination(mv_bus_coordinates, bearing=0).latitude
-        point_lon = distance(meters=node_coords.x).destination(mv_bus_coordinates, bearing=0).longitude
-
-        final_point = GeopyPoint(point_lat, point_lon) 
-        lat, lon = final_point.latitude, final_point.longitude
-
-        #Update bus_geodata with local XY
-        random_net_lv.bus_geodata.loc[node, 'x'] = node_coords.x
-        random_net_lv.bus_geodata.loc[node, 'y'] = node_coords.y
-
-        #update bus table with lat/lon
-        random_net_lv.bus.loc[node, 'lat'] = lat
-        random_net_lv.bus.loc[node, 'lon'] = lon
-
-        #update graph node with latlon
-        graph.nodes[node]['latlon'] = GeopyPoint(lat, lon)
-
-    #now, use the graph to create the lines
-    for bus_u, bus_v in graph.edges:
-        # Compute Euclidean distance (assuming coordinates in meters)
-        length = graph.nodes[bus_u]['coordinates'].distance(graph.nodes[bus_v]['coordinates']) / 1000.0  #distance in km        
-
-        if graph[bus_u][bus_v]['type'] == 'lv_line':
-            # Create line in pandapower
-            pp.create_line(
-                random_net_lv,
-                from_bus=bus_u,
-                to_bus=bus_v,
-                length_km=length,
-                std_type=graph[bus_u][bus_v]['std_type'],
-                name=graph[bus_u][bus_v]['name']
-            )
-        elif graph[bus_u][bus_v]['type'] == 'transformer':
-            # Create transformer in pandapower
-            create_cigre_lv_transformer(
-                                        random_net_lv,
-                                        bus_u,
-                                        bus_v,
-                                        graph[bus_u][bus_v]['name'],
-                                        graph[bus_u][bus_v]['transformer_type']
-                                    )
-    return random_net_lv 
-
-
-
-def generate_random_graph_net(CommercialRange, IndustrialRange, ResidencialRange,                            
-                            ForkLengthRange, LineBusesRange, LineForksRange,
-                            mv_bus_coordinates=(0.0, 0.0),
-                            ):       
-
-    graph = nx.DiGraph()
-    # Add the main 20 kV bus (medium voltage)
-    mv_bus = graph.number_of_nodes()
-    graph.add_node(mv_bus, name='MV Bus', vn_kv=20.0, type='b', zone='CIGRE_LV')
-    
-    def add_transformer_branch(transformer_type, branch_index, parent_bus, graph):
-        # Create LV bus (0.4 kV)        
-        working_bus_name = f"{str(transformer_type)}_Branch{branch_index}_trafo_lv_bus"
-        
-        working_bus = graph.number_of_nodes()
-        graph.add_node(working_bus)
-        
-        # Add transformer from MV to LV        
-        graph.add_edge(parent_bus, working_bus, name=f"{str(transformer_type)}_{branch_index}_Trafo",type='transformer', transformer_type=transformer_type)    
-        graph.nodes[working_bus]['name'] = working_bus_name
-        #graph.edges[parent_bus][working_bus]['name'] = f"{str(transformer_type)}_{branch_index}_Trafo" 
-        #graph.edges[parent_bus][working_bus]['type'] = 'transformer'
-                
-        #randomize how many forks this line will be
-        Forks = random.randint(*LineForksRange)
-        
-        #randomize how many buses will be in this branch
-        NumBuses = random.randint(*LineBusesRange)
-        
-        #distribute NumBuses across the forks
-        fork_bus_counts = [1] * Forks  # start with 1 bus per fork
-        remaining = NumBuses - Forks
-        for _ in range(remaining):
-            fork_bus_counts[random.randint(0, Forks - 1)] += 1
-        
-        added_busses = []        
-        
-        # Create branches/forks
-        for f in range(Forks):                        
-            for b in range(fork_bus_counts[f]):
-                #create the bus
-                new_bus_name = f"{str(transformer_type)}_Branch{branch_index}_fork{f}bus{b}"
-                new_bus = graph.number_of_nodes()
-                graph.add_node(new_bus)
-                graph.nodes[new_bus]['name'] = new_bus_name
-                graph.nodes[new_bus]['vn_kv'] = 0.4
-                graph.nodes[new_bus]['type'] = 'm'
-                graph.nodes[new_bus]['zone'] = 'CIGRE_LV'
-                graph.add_edge(working_bus, new_bus)  #the lines can only be created after all buses are positioned (only then I will know its lengths)                          
-                graph[working_bus][new_bus]['type'] = 'lv_line'
-                graph[working_bus][new_bus]['std_type'] = 'OH1'
-                graph[working_bus][new_bus]['name'] = f"Line {graph.nodes[working_bus]['name']}-{graph.nodes[new_bus]['name']}"
-
-                added_busses.append(new_bus)    
-                working_bus = new_bus
-                working_bus_name = new_bus_name
-
-            #pick a random child bus to connect the next fork
-            if f < Forks - 1:
-                working_bus = random.choice(added_busses)
-            else:
-                working_bus = parent_bus    
-            
-            # Retrieve the parent_bus_name from net_cigre_lv            
-            working_bus_name = graph.nodes[working_bus]['name']
-        
-        return added_busses
-
-    # Create transformers by type
-    Ct = random.randint(*CommercialRange)
-    It = random.randint(*IndustrialRange)
-    Rt = random.randint(*ResidencialRange)
-
-    for i in range(Ct):
-        new_lines = add_transformer_branch(
-            transformer_type=NetworkType.COMMERCIAL,
-            branch_index=i,
-            parent_bus=mv_bus,            
-            graph=graph            
-            )        
-    for i in range(It):
-        new_lines = add_transformer_branch(
-            transformer_type=NetworkType.INDUSTRIAL,
-            branch_index=i,
-            parent_bus=mv_bus,            
-            graph=graph                        
-            )    
-    for i in range(Rt):
-        new_lines = add_transformer_branch(
-            transformer_type=NetworkType.RESIDENTIAL,
-            branch_index=i,
-            parent_bus=mv_bus,            
-            graph=graph                        
-            )        
-    
-    success = generate_network_coordinates(        
-        root_bus_index=mv_bus,        
-        graph=graph,        
-        max_attempts=50  # Maximum attempts to place a point
-    ) 
-    return graph
-
-def generate_pandapower_net_old(CommercialRange, IndustrialRange, ResidencialRange,                            
-                            ForkLengthRange, LineBusesRange, LineForksRange,
-                            mv_bus_coordinates=(0.0, 0.0),
-                            ):
-    
-    graph = generate_random_graph_net(
-        CommercialRange=CommercialRange,
-        IndustrialRange=IndustrialRange,
-        ResidencialRange=ResidencialRange,
-        ForkLengthRange=ForkLengthRange,
-        LineBusesRange=LineBusesRange,
-        LineForksRange=LineForksRange,
-        mv_bus_coordinates=mv_bus_coordinates
-    )
-    
-    mv_bus_index = next(node for node, attrs in graph.nodes(data=True) if attrs.get('name') == 'MV Bus')
-    net = generate_pandapower_net_from_graph(
-        graph=graph,
-        mv_bus_index=mv_bus_index  
-    )
-    return net, graph
-
-
-def convert_coordinates_to_pandapower(random_net_lv, graph, mv_bus_coordinates=None):
-    """
-    Convert graph.nodes[node]["coordinates"] to both formats expected by pandapower
-    (bus.geo, line.geo and also net.bus_geodata formats)
-    
-    Args:
-        random_net_lv: pandapower network
-        graph: networkx graph with coordinates
-        mv_bus_coordinates: optional geopy coordinates for MV bus
-    """
-    # Initialize bus_geodata if it doesn't exist
-    if random_net_lv.bus_geodata.empty:
-        random_net_lv.bus_geodata = pd.DataFrame(columns=['x', 'y'])
-    
-    # Make sure the bus DataFrame has the geo column
-    if 'geo' not in random_net_lv.bus.columns:
-        random_net_lv.bus['geo'] = None
-    
-    # Create line_geodata DataFrame if it doesn't exist
-    if 'line_geodata' not in random_net_lv:
-        random_net_lv.line_geodata = pd.DataFrame(columns=['coords'])
-    elif random_net_lv.line_geodata.empty:
-        random_net_lv.line_geodata = pd.DataFrame(columns=['coords'])
-    
-    # Process bus coordinates
-    for node in graph.nodes:
-        if 'coordinates' in graph.nodes[node] and graph.nodes[node]['coordinates'] is not None:
-            node_coords = graph.nodes[node]['coordinates']
-            
-            # Update bus_geodata with XY coordinates
-            random_net_lv.bus_geodata.loc[node, 'x'] = node_coords.x
-            random_net_lv.bus_geodata.loc[node, 'y'] = node_coords.y
-            
-            # Update bus.geo with GeoJSON geometry
-            geo_point = {
-                "type": "Point", 
-                "coordinates": [node_coords.x, node_coords.y]
-            }
-            random_net_lv.bus.loc[node, 'geo'] = geo_point
-            
-            # Convert to lat/lon if mv_bus_coordinates are provided
-            if mv_bus_coordinates is not None:
-                point_lat = distance(meters=node_coords.y).destination(mv_bus_coordinates, bearing=0).latitude
-                point_lon = distance(meters=node_coords.x).destination(mv_bus_coordinates, bearing=90).longitude
-                
-                #update bus table with lat/lon
-                random_net_lv.bus.loc[node, 'lat'] = point_lat
-                random_net_lv.bus.loc[node, 'lon'] = point_lon
-    
-    # Process line coordinates
-    for idx, line in random_net_lv.line.iterrows():
-        from_bus = line.from_bus
-        to_bus = line.to_bus
-        
-        if (from_bus in graph.nodes and 'coordinates' in graph.nodes[from_bus] and 
-            to_bus in graph.nodes and 'coordinates' in graph.nodes[to_bus]):
-            
-            from_coords = graph.nodes[from_bus]['coordinates']
-            to_coords = graph.nodes[to_bus]['coordinates']
-            
-            # Create line coordinates as a list of points
-            line_coords = [(from_coords.x, from_coords.y), (to_coords.x, to_coords.y)]
-            random_net_lv.line_geodata.loc[idx, 'coords'] = line_coords
-            
-            # Update line.geo with GeoJSON geometry
-            geo_line = {
-                "type": "LineString",
-                "coordinates": [[from_coords.x, from_coords.y], [to_coords.x, to_coords.y]]
-            }
-            random_net_lv.line.loc[idx, 'geo'] = geo_line
-    
-    return random_net_lv
-
 
 
 def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,                            
