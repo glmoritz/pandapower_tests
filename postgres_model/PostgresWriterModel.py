@@ -6,6 +6,7 @@ import json
 import random
 import threading
 import queue
+import re
 
 META = {
     'type': 'event-based',
@@ -23,6 +24,56 @@ META = {
     },
 }
 
+def parse_variable_name(var_name):
+    """Parse variable name and return structured data"""
+    # Get the rightmost part after any dot
+    if '.' in var_name:
+        parts = var_name.split('.')        
+        element_part = parts[-1]   # e.g. "HouseholdProducer_0-EnergyConsumption[MWh]"
+    else:        
+        element_part = var_name
+      
+    
+    # Extract element and output parts
+    # This handles patterns like:
+    # - HouseholdProducer_0-EnergyConsumption[MWh]
+    # - Bus-1-P_a[MW]
+    element_parts = element_part.split('-')
+    
+    # The output with unit is always the last part
+    output_with_unit = element_parts[-1]
+    
+    # The element info is in the earlier parts
+    element_info = '-'.join(element_parts[:-1]) if len(element_parts) > 1 else ""
+    
+    # Extract element type and index
+    element_type = None
+    element_index = None
+    
+    # Try to extract element info with different patterns
+    if element_info:
+        # Try pattern like "HouseholdProducer_0" or "Bus-1"
+        element_match = re.search(r'([A-Za-z]+)(?:_|-)?(\d+)?', element_info)
+        if element_match:
+            element_type = element_match.group(1)
+            if element_match.group(2):
+                element_index = int(element_match.group(2))
+    
+    # Extract unit if present
+    unit = None
+    if '[' in output_with_unit and ']' in output_with_unit:
+        unit_match = re.search(r'\[([^\]]+)\]', output_with_unit)
+        if unit_match:
+            unit = unit_match.group(1)
+    
+    
+    return {
+        'element': element_info,  # e.g., "HouseholdProducer_0" or "Bus-1"
+        'element_type': element_type.lower() if element_type else None,  # e.g., "householdproducer"
+        'element_index': element_index,  # e.g., 0 or 1        
+        'output': output_with_unit,  # e.g., "EnergyConsumption[MWh]"
+        'unit': unit,  # e.g., "MWh"        
+    }
 
 class PostgresWriterModel(mosaik_api.Simulator):
     def __init__(self):
@@ -112,27 +163,8 @@ class PostgresWriterModel(mosaik_api.Simulator):
         # Prepare batch data
         var_data = []
         for var_name in new_vars:
-            # Parse the variable name (same parsing logic as before)
-            parts = var_name.split('.')
-            if len(parts) == 2:
-                element_part = parts[1]
-                element_parts = element_part.rsplit('-', 1)
-                if len(element_parts) == 2:
-                    element = element_parts[0]
-                    input_with_unit = element_parts[1]
-                    unit = None
-                    if '[' in input_with_unit and ']' in input_with_unit:
-                        unit = input_with_unit.split('[')[1].split(']')[0]
-                    extra_info = {
-                        'element': element,
-                        'input': input_with_unit,
-                        'unit': unit
-                    }
-                else:
-                    extra_info = {}
-            else:
-                extra_info = {}
             
+            extra_info = parse_variable_name(var_name)            
             var_data.append((self.simulation_id, var_name, extra_info.get('unit'), json.dumps(extra_info)))
 
         # Solution 1: Disable pagination in execute_values
@@ -197,6 +229,7 @@ class PostgresWriterModel(mosaik_api.Simulator):
 
     def _flush_worker(self):
         """Background thread that flushes queued DataFrames to DB."""
+        first_flush = True        
         while not self.stop_event.is_set() or not self.flush_queue.empty():
             try:
                 df = self.flush_queue.get(timeout=0.5)
@@ -208,8 +241,9 @@ class PostgresWriterModel(mosaik_api.Simulator):
                 break
 
             if self.output_csv:
-                df.to_csv(self.output_file, mode='a', header=False,
+                df.to_csv(self.output_file, mode='w' if first_flush else 'a', header=first_flush,
                           date_format=self.date_format, na_rep=self.nan_representation)
+                first_flush = False
 
             if self.write_to_db:
                 self._flush_to_db(df)
@@ -229,7 +263,7 @@ class PostgresWriterModel(mosaik_api.Simulator):
             df_data.set_index('date', inplace=True)
         else:
             self.attrs = list(data_dict.keys())
-            df_data = pd.DataFrame(data_dict)
+            df_data = pd.DataFrame(data_dict, columns=self.attrs)
             df_data.set_index('date', inplace=True)
 
         if time == 0:

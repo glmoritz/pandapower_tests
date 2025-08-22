@@ -295,7 +295,7 @@ def run_simulation(params):
                                             db_connection=db,                                                                                                                                    
                                             write_to_db=True,
                                             simulation_params=params,
-                                            output_csv=False,
+                                            output_csv=True,
                                             output_file=f'{params['results_dir']}/{params['output_file']}',
                                             time_resolution=1)                                              
     result_writer = result_output_model.PostgresWriterModel(buff_size=int(params['step_size_s']))
@@ -339,7 +339,13 @@ def run_simulation(params):
         graph.nodes[bus.extra_info['index']]['bus_element'] = bus
         
     for trafo in trafos:
-        world.connect(trafo, result_writer, "Loading[%]")  
+        world.connect(trafo, result_writer, "Loading[%]") 
+        world.connect(trafo, result_writer, "P_a_lv[MW]") 
+        world.connect(trafo, result_writer, "P_b_lv[MW]") 
+        world.connect(trafo, result_writer, "P_c_lv[MW]") 
+        world.connect(trafo, result_writer, "Q_a_lv[MVar]") 
+        world.connect(trafo, result_writer, "Q_b_lv[MVar]") 
+        world.connect(trafo, result_writer, "Q_c_lv[MVar]")         
 
     #output line information
     for line in lines:
@@ -358,6 +364,9 @@ def run_simulation(params):
         # world.connect(line, csv_writer, "QIn[MVar]")
         # world.connect(line, csv_writer, "QOut[MVar]")
 
+    for bus in buses:        
+        graph.nodes[bus.extra_info['index']]['bus_element'] = bus
+    
     #connect charger csv file to charger connection
     #world.connect(charger_model[0],charger1, ("P[MW]","P[MW]"))
     
@@ -394,6 +403,14 @@ def run_simulation(params):
                 #connect the irradiance model to the household model
                 world.connect(irradiation_model, result_writer, "DNI[W/m2]")
                 world.connect(irradiation_model, house_model, ("DNI[W/m2]","Irradiance[W/m2]"))
+
+                #output house statistics to simulation results
+                world.connect(house_model, result_writer, 'EnergyExported[MWh]')
+                world.connect(house_model, result_writer, 'EnergyImported[MWh]')
+                world.connect(house_model, result_writer, 'PVGeneration[MWh]')
+                world.connect(house_model, result_writer, 'EnergyConsumption[MWh]')
+                world.connect(house_model, result_writer, 'SOC[MWh]')
+                
 
                 #connect the household inverter to the bus (in random phases)
                 inverter_phases = ['a', 'b', 'c']

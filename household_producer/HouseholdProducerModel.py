@@ -174,8 +174,11 @@ class HouseholdProducerModel(mosaik_api.Simulator):
             # ---- CURTAILMENT helpers
             pv_curtail_mw      = 0.0
             charge_power_mw    = 0.0            
-            export_to_grid_mw  = 0.0                        
-            
+            export_to_grid_mw  = 0.0 
+
+            last_charge_power_mw = entity.get('last_charge_power_mw', 0.0)                     
+            approximate_current_soc_mwh = soc_mwh + (last_charge_power_mw) * step_hours * (entity['charge_efficiency'] if charge_power_mw > 0 else 1.0/entity['discharge_efficiency'])  # charging efficiency
+            minimum_battery_operation_time = 10.0
 
             # ---- CASE A: PV surplus ------------------------------------------------
             if surplus_mw > 0:
@@ -195,15 +198,23 @@ class HouseholdProducerModel(mosaik_api.Simulator):
                     grid_req_mw -= extra_for_grid  # reduce request
 
                 if grid_req_mw > 0:                    
-                    # try to discharge to meet request                    
-                    charge_power_mw = -1*min(grid_req_mw, max_dch_mw)
-                    grid_req_mw += -1*charge_power_mw  # reduce request
+                    # try to discharge to meet request                                         
+                    # Only discharge if battery has enough energy to sustain output for at least minimum_battery_operation_time seconds                    
+                    potential_discharge_mw = min(grid_req_mw, max_dch_mw)
+                    min_required_soc_mwh = potential_discharge_mw * (minimum_battery_operation_time/3600.0) / entity['discharge_efficiency']                    
+                    if approximate_current_soc_mwh > min_required_soc_mwh:
+                        charge_power_mw = -1 * potential_discharge_mw
+                        grid_req_mw += charge_power_mw  # reduce request (charge_power_mw is negative)
 
                 # 2) if still surplus, we can charge the battery                
                 if surplus_mw > 0:
-                    if soc_mwh < cap_mwh:                    
-                        charge_power_mw = min(surplus_mw, max_chg_mw)                    
-                        surplus_mw -= charge_power_mw
+                    # Only charge if we have enough surplus to sustain charging for minimum_battery_operation_time seconds
+                    if approximate_current_soc_mwh < cap_mwh:
+                        potential_charge_mw = min(surplus_mw, max_chg_mw)
+                        # Check if we have enough surplus to maintain this charge rate for minimum_battery_operation_time
+                        if potential_charge_mw > 0 and potential_charge_mw * (minimum_battery_operation_time/3600.0) <= surplus_mw * step_hours:
+                            charge_power_mw = potential_charge_mw
+                            surplus_mw -= charge_power_mw
                 
                 # 3) export whatever remains, limited by export_cap
                 extra_for_grid += surplus_mw
@@ -215,9 +226,13 @@ class HouseholdProducerModel(mosaik_api.Simulator):
             else:
                 deficit_mw = -surplus_mw  # positive number
                 # 1) discharge battery first
-                if soc_mwh > 0:
-                    charge_power_mw = -1*min(deficit_mw, max_dch_mw)
-                    deficit_mw += charge_power_mw #the charge power here is negative, so it reduces the deficit
+                # but Only discharge if battery has enough energy to sustain output for at least minimum_battery_operation_time seconds
+                potential_discharge_mw = min(deficit_mw, max_dch_mw)
+                min_required_soc_mwh = potential_discharge_mw * (minimum_battery_operation_time/3600.0) / entity['discharge_efficiency']
+                
+                if approximate_current_soc_mwh > min_required_soc_mwh:
+                    charge_power_mw = -1*potential_discharge_mw
+                    deficit_mw += charge_power_mw  # charge_power_mw is negative, so it reduces the deficit
 
                 # 2) remaining deficit is imported from grid *only if battery empty*
                 export_to_grid_mw = -1*deficit_mw  # may be 0 if fully covered. negative means grid import
@@ -230,20 +245,19 @@ class HouseholdProducerModel(mosaik_api.Simulator):
 
             
 
-            # How fast is the battery (dis)charging right now?            
-            last_charge_power_mw = entity.get('last_charge_power_mw', 0.0)
-            soc_mwh += 0.5*(last_charge_power_mw+charge_power_mw) * step_hours * (entity['charge_efficiency'] if charge_power_mw > 0 else entity['discharge_efficiency'])  # charging efficiency
+            # How fast is the battery (dis)charging right now?                        
+            soc_mwh += 0.5*(last_charge_power_mw+charge_power_mw) * step_hours * (entity['charge_efficiency'] if charge_power_mw > 0.0 else 1.0/entity['discharge_efficiency'])  # charging efficiency
             soc_percent = 100.0 * soc_mwh / cap_mwh if cap_mwh > 0 else 0.0
             if charge_power_mw > 0 and soc_mwh < cap_mwh:
                 #charging
                 secs_to_full = 3600.0 * (cap_mwh - soc_mwh) / (charge_power_mw * entity['charge_efficiency'])  # charging efficiency
-                next_max_adv = min(next_max_adv, secs_to_full)
+                next_max_adv = int(min(next_max_adv, secs_to_full))
             elif charge_power_mw < 0 and soc_mwh > 0:
                 #discharging
                 secs_to_empty = 3600.0 * soc_mwh / (-charge_power_mw / entity['discharge_efficiency'])  # discharging efficiency
-                next_max_adv = min(next_max_adv, secs_to_empty)
+                next_max_adv = int(min(next_max_adv, secs_to_empty))
 
-            next_max_adv = max(1.0, next_max_adv)  # never < 1 s
+            next_max_adv = max(1, next_max_adv)  # never < 1 s
 
             # -----------------------------------------------------------------
             # 8. STORE EVERYTHING WE NEED NEXT STEP
@@ -291,9 +305,10 @@ class HouseholdProducerModel(mosaik_api.Simulator):
             
             for phase in ['a', 'b', 'c']:
                 if results[eid][f'P_{phase}_load[MW]'] < 0:
-                    grid_exported_mwh += 0.5*(results[eid][f'P_{phase}_load[MW]']+(p_per_phase if phase in phases else 0.0)) * step_hours
-                else:
                     grid_imported_mwh += -0.5*(results[eid][f'P_{phase}_load[MW]']+(p_per_phase if phase in phases else 0.0)) * step_hours
+                else:
+                    grid_exported_mwh += 0.5*(results[eid][f'P_{phase}_load[MW]']+(p_per_phase if phase in phases else 0.0)) * step_hours
+                    
 
             #update the energy values with the current step values (trapezoidal integration)
             cultailment_energy_mwh   = entity.get('CurtailmentEnergy[MWh]', 0.0) + 0.5*(results[eid].get('Curtailment[MW]', 0.0)+pv_curtail_mw) * step_hours
@@ -316,7 +331,7 @@ class HouseholdProducerModel(mosaik_api.Simulator):
             
         # Keep a snapshot for get_data()
         self.results = results
-        return time+self.time_step 
+        return time+next_max_adv
 
 
     def get_data(self, outputs):
