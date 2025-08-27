@@ -286,7 +286,7 @@ def run_simulation(params):
                                             sim_start=params['start_time'],
                                             sim_end=sim_end_dt.strftime('%Y-%m-%d %H:%M:%S'),
                                             db_connection=db,
-                                            sql_rows=['power_kw'],
+                                            sql_rows=['Power[kW]'],
                                             date_format='%Y-%m-%d %H:%M:%S',
                                             type="time-based")                                          
 
@@ -405,13 +405,16 @@ def run_simulation(params):
                 world.connect(irradiation_model, house_model, ("DNI[W/m2]","Irradiance[W/m2]"))
 
                 #output house statistics to simulation results
-                world.connect(house_model, result_writer, 'EnergyExported[MWh]')
-                world.connect(house_model, result_writer, 'EnergyImported[MWh]')
-                world.connect(house_model, result_writer, 'PVGeneration[MWh]')
-                world.connect(house_model, result_writer, 'EnergyConsumption[MWh]')
-                world.connect(house_model, result_writer, 'SOC[MWh]')
-                
-
+                #world.connect(house_model, result_writer, 'EnergyExported[MWh]')
+                #world.connect(house_model, result_writer, 'EnergyImported[MWh]')
+                #world.connect(house_model, result_writer, 'PVEnergyGeneration[MWh]')
+                #world.connect(house_model, result_writer, 'EnergyConsumption[MWh]')
+                world.connect(house_model, result_writer, 'SOC[percent]')
+                #world.connect(house_model, result_writer, 'BatteryEnergyStored[MWh]')
+                #world.connect(house_model, result_writer, 'BatteryEnergyConsumed[MWh]')
+                world.connect(house_model, result_writer, 'PVPowerGeneration[MW]')
+                world.connect(house_model, result_writer, 'BatteryPower[MW]')            
+     
                 #connect the household inverter to the bus (in random phases)
                 inverter_phases = ['a', 'b', 'c']
 
@@ -419,6 +422,7 @@ def run_simulation(params):
                     for k, bus_phase in enumerate(graph.nodes[bus]['inverter_connection_phases']):
                         world.connect(house_model,graph.nodes[bus]['bus_element'], (f'Q_{inverter_phases[k]}_load[MVar]',f'Q_{bus_phase}_load[MVar]'))
                         world.connect(house_model,graph.nodes[bus]['bus_element'], (f'P_{inverter_phases[k]}_load[MW]',f'P_{bus_phase}_load[MW]'))
+                        world.connect(house_model, result_writer, f'P_{bus_phase}_load[MW]')            
 
                 if 'connected_buildings_ids' in graph.nodes[bus]: 
                     bldg_ids = ', '.join(graph.nodes[bus]['connected_buildings_ids'])
@@ -427,7 +431,7 @@ def run_simulation(params):
                     interval_str = f'{params['step_size_s']} seconds'            
                     sql_query = f"""
                             SELECT time_bucket(INTERVAL '{interval_str}', sample_time) AS bucket,
-                            SUM(electricity_total_energy_consumption) / 0.25 AS power_kw
+                            SUM(electricity_total_energy_consumption) / 0.25 AS \"Power[kW]\"
                             FROM building_power.building_power
                             WHERE bldg_id IN ({bldg_ids})
                                 AND sample_time >= '{sim_start_dt.strftime('%Y-%m-%d %H:%M:%S')}'
@@ -439,7 +443,8 @@ def run_simulation(params):
 
                     power_model = power_consumption_sim.PostgresReader(query=[sql_query])
 
-                    world.connect(power_model, house_model, ("power_kw","PowerConsumption[MW]"), transform=lambda kw_val: kw_val / 1000) # Convert kW to MW
+                    world.connect(power_model, house_model, ("Power[kW]","PowerConsumption[MW]"), transform=lambda kw_val: kw_val / 1000) # Convert kW to MW
+                    world.connect(power_model, result_writer, 'Power[kW]')            
                     
             
     world.run(until=float(params['simulation_time_s']))

@@ -276,9 +276,7 @@ class PostgresWriterModel(mosaik_api.Simulator):
 
         return None
 
-    def finalize(self):
-        if not self.df.empty:
-            self.flush_queue.put(self.df.copy())
+    def finalize(self):      
 
         # Signal flush thread to stop
         self.stop_event.set()
