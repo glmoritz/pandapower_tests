@@ -118,6 +118,7 @@ SELECT create_hypertable('building_power.output_timeseries', 'ts', chunk_time_in
 
 -- Index for fast lookup by variable and timestamp
 CREATE INDEX ON building_power.output_timeseries (variable_id, ts DESC);
+CREATE UNIQUE INDEX uniq_output_timeseries ON building_power.output_timeseries (variable_id, ts);
 
 --------------------------------------------------------------------------------
 -- 4. COMPRESSION SETTINGS

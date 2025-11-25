@@ -352,10 +352,9 @@ class HouseholdProducerModel(mosaik_api.Simulator):
                 'BatteryPower[MW]': charge_power_mw
             })         
             
-        # Keep a snapshot for get_data()
-
-        self.results[eid] = {}
-        self.results[eid].update(step_results)
+            # Keep a snapshot for get_data()
+            self.results[eid] = {}
+            self.results[eid].update(step_results)
         return time+next_max_adv
 
 

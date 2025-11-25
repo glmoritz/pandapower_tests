@@ -21,6 +21,8 @@ import random
 from pandapower.create import create_load
 from datetime import datetime, timedelta
 import psycopg2
+from dotenv import load_dotenv
+load_dotenv()
 
 # Add local-mosaik-pandapower-2.src.mosaik_components to Python path
 pandapower_module_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'local-mosaik-pandapower-2', 'src'))
@@ -40,6 +42,7 @@ if postgres_module_path not in sys.path:
     sys.path.insert(0, postgres_module_path)
 
 import irradiation_model
+
 
 def getElementbyName(grid, name):
     """
@@ -214,12 +217,14 @@ def run_simulation(params):
 
     world = mosaik.World(SIM_CONFIG)
 
+    load_dotenv()
+
     db = {
-        "dbname": "duilio",
-        "user": "root",
-        "password": "skamasfrevrest",
-        "host": "103.0.1.37",
-        "port": 5433  # or your port
+        "dbname": os.getenv("POSTGRES_DB_NAME", "duilio"),
+        "user": os.getenv("POSTGRES_DB_USER", "root"),
+        "password": os.getenv("POSTGRES_DB_PASSWORD", "skamasfrevrest"),
+        "host": os.getenv("POSTGRES_DB_HOST", "103.0.2.7"),
+        "port": int(os.getenv("POSTGRES_DB_PORT", "5433"))
     }
 
     net, graph = None, None
