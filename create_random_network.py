@@ -145,7 +145,7 @@ def save_network_to_database(graph: nx.Graph, net, db_connection, grid_name):
                 """, (historical_grid_name, old_grid_id))
                 
                 # Commit the name update so we can create a new grid with the original name
-                conn.commit()
+                conn.commit()                
         
         pandapower_grid_id = to_sql(net=net,
                          conn=conn,

@@ -65,6 +65,7 @@ python-dateutil==2.9.0.post0
 python-dotenv==1.1.0
 pytz==2025.2
 pyzmq==26.4.0
+psycopg2
 requests==2.32.3
 scipy==1.13.1
 shapely==2.1.1

@@ -20,7 +20,7 @@
 	"runArgs": [
         // Use the network stack of the host machine
         "--net=host",
-		"-v", "sigivest_simulation_results:/results"
+		"-v", "/home/moritz/duilio/simulation_results:/results"
     ]
 
 
