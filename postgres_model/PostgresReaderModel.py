@@ -87,7 +87,7 @@ Note:
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-import psycopg2
+from sqlalchemy import create_engine, text
 
 import mosaik_api_v3 as mosaik_api
 from typing_extensions import override
@@ -163,7 +163,10 @@ class PostgresReaderModel(mosaik_api.Simulator):
             'params': ['query'],
             'attrs': self.attrs,
         } 
-        self.conn = psycopg2.connect(**db_connection)    
+        # Create SQLAlchemy engine
+        db_url = f"postgresql://{db_connection['user']}:{db_connection['password']}@{db_connection['host']}:{db_connection['port']}/{db_connection['dbname']}"
+        self.engine = create_engine(db_url)
+        self.conn = self.engine.connect()
         return self.meta
 
     @override
@@ -179,12 +182,12 @@ class PostgresReaderModel(mosaik_api.Simulator):
                 raise ValueError(f'Parameter "{key}" must be a list of size {num}')
         
         entities = []
-        cursor = self.conn.cursor()
         for i in range(len(params['query'])):
-            #execute query to get data            
-            cursor.execute(params['query'][i])
-            rows = cursor.fetchall()            
-            columns = [desc[0] for desc in cursor.description]
+            #execute query to get data
+            query = text(params['query'][i])
+            result = self.conn.execute(query)
+            rows = result.fetchall()
+            columns = result.keys()
             # Create DataFrame
             eid = f'{self.eid_prefix}_{len(self.entities)+i}'
             df = pd.DataFrame(rows, columns=columns)
@@ -194,7 +197,6 @@ class PostgresReaderModel(mosaik_api.Simulator):
                 'current_time': 0
             }
             entities.append({'eid': eid, 'type': model})
-        cursor.close()
         return entities
         
 

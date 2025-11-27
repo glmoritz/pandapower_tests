@@ -1,7 +1,6 @@
 import pandas as pd
 import mosaik_api_v3 as mosaik_api
-import psycopg2
-from psycopg2.extras import execute_values
+from sqlalchemy import create_engine, text
 import json
 import random
 import threading
@@ -89,8 +88,8 @@ class PostgresWriterModel(mosaik_api.Simulator):
         self.nan_representation = None
 
         # DB related
+        self.engine = None
         self.conn = None
-        self.cur = None
         self.write_to_db = False
         self.simulation_id = None
         self.variable_map = {}  # maps var name -> variable_id
@@ -123,16 +122,15 @@ class PostgresWriterModel(mosaik_api.Simulator):
 
         # DB connection if enabled
         if self.write_to_db and db_connection:
-            self.conn = psycopg2.connect(**db_connection)
-            self.cur = self.conn.cursor()
+            db_url = f"postgresql://{db_connection['user']}:{db_connection['password']}@{db_connection['host']}:{db_connection['port']}/{db_connection['dbname']}"
+            self.engine = create_engine(db_url)
+            self.conn = self.engine.connect()
 
             # Insert simulation metadata
             sim_params_json = json.dumps(simulation_params) if simulation_params else '{}'
-            self.cur.execute(
-                "INSERT INTO building_power.simulation_outputs(parameters) VALUES (%s) RETURNING simulation_output_id;",
-                (sim_params_json,)
-            )
-            self.simulation_id = self.cur.fetchone()[0]
+            query = text("INSERT INTO building_power.simulation_outputs(parameters) VALUES (:params) RETURNING simulation_output_id;")
+            result = self.conn.execute(query, {"params": sim_params_json})
+            self.simulation_id = result.fetchone()[0]
             self.conn.commit()
 
         # Start background flush thread
@@ -160,43 +158,42 @@ class PostgresWriterModel(mosaik_api.Simulator):
         if not new_vars:
             return [self.variable_map[v] for v in var_names]
         
-        # Prepare batch data
-        var_data = []
+        # Insert variables one by one and collect results
         for var_name in new_vars:
+            extra_info = parse_variable_name(var_name)
+            query = text("""
+                INSERT INTO building_power.variable(
+                    simulation_output_id, 
+                    variable_name, 
+                    unit, 
+                    extra_info
+                ) VALUES (:sim_id, :var_name, :unit, :extra_info)
+                RETURNING variable_id, variable_name;
+            """)
             
-            extra_info = parse_variable_name(var_name)            
-            var_data.append((self.simulation_id, var_name, extra_info.get('unit'), json.dumps(extra_info)))
-
-        # Solution 1: Disable pagination in execute_values
-        execute_values(
-            self.cur,
-            """INSERT INTO building_power.variable(
-                simulation_output_id, 
-                variable_name, 
-                unit, 
-                extra_info
-            ) VALUES %s RETURNING variable_id, variable_name;""",
-            var_data,
-            page_size=len(var_data)  # Set page_size to total records to get all results
-        )
-        
-        # Fetch results and update cache
-        results = self.cur.fetchall()
-        for var_id, var_name in results:
-            self.variable_map[var_name] = var_id
+            result = self.conn.execute(query, {
+                "sim_id": self.simulation_id,
+                "var_name": var_name,
+                "unit": extra_info.get('unit'),
+                "extra_info": json.dumps(extra_info)
+            })
+            
+            var_id, var_name_ret = result.fetchone()
+            self.variable_map[var_name_ret] = var_id
         
         self.conn.commit()
         
         # For any vars that weren't inserted (due to concurrent inserts), get their existing IDs
         missing_vars = set(new_vars) - set(self.variable_map.keys())
         if missing_vars:
-            self.cur.execute("""
+            query = text("""
                 SELECT variable_id, variable_name 
                 FROM building_power.variable
-                WHERE variable_name = ANY(%s)
-            """, (list(missing_vars),))
+                WHERE variable_name = ANY(:var_names)
+            """)
+            result = self.conn.execute(query, {"var_names": list(missing_vars)})
             
-            for var_id, var_name in self.cur.fetchall():
+            for var_id, var_name in result.fetchall():
                 self.variable_map[var_name] = var_id
         
         return [self.variable_map[v] for v in var_names]
@@ -216,14 +213,16 @@ class PostgresWriterModel(mosaik_api.Simulator):
             for col, value in row.items():
                 if pd.isna(value):
                     continue
-                records.append((var_id_map[col], ts, float(value)))
+                records.append({
+                    "variable_id": var_id_map[col],
+                    "ts": ts,
+                    "quantity": float(value)
+                })
         
         if records:
-            execute_values(
-                self.cur,
-                "INSERT INTO building_power.output_timeseries (variable_id, ts, quantity) VALUES %s;",
-                records
-            )
+            # Insert records in batches
+            query = text("INSERT INTO building_power.output_timeseries (variable_id, ts, quantity) VALUES (:variable_id, :ts, :quantity);")
+            self.conn.execute(query, records)
         
         self.conn.commit()
 
@@ -284,7 +283,6 @@ class PostgresWriterModel(mosaik_api.Simulator):
         self.flush_thread.join()
 
         if self.write_to_db and self.conn:
-            self.cur.close()
             self.conn.close()
 
 

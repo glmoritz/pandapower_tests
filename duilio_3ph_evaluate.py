@@ -20,7 +20,7 @@ import time
 import random
 from pandapower.create import create_load
 from datetime import datetime, timedelta
-import psycopg2
+from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -145,10 +145,10 @@ def distribute_loads_to_buses(net, graph, params, db):
                 split_loads = [bus_loads[i]]
 
             #now execute a query to find buildings that have split_loads[i] as average power consumption
-            sql = """
+            sql = text("""
                     WITH targets(avg_power) AS 
                     (
-                        SELECT unnest(%s::float8[])
+                        SELECT unnest(:split_loads::float8[])
                     ), 
                     candidate_buildings AS 
                     (
@@ -159,8 +159,8 @@ def distribute_loads_to_buses(net, graph, params, db):
                         AVG(electricity_total_energy_consumption / 0.25) AS avg_power_kw
                     FROM building_power.building_power
                     WHERE electricity_total_energy_consumption IS NOT NULL
-                    AND sample_time >= %s
-                    AND sample_time <= %s
+                    AND sample_time >= :start_time
+                    AND sample_time <= :end_time
                     GROUP BY bldg_id
                     ) 
                     SELECT DISTINCT ON (t.avg_power) 
@@ -170,17 +170,22 @@ def distribute_loads_to_buses(net, graph, params, db):
                         ABS(cb.avg_power_kw - t.avg_power) AS deviation_kw 
                         FROM targets t 
                         JOIN candidate_buildings cb 
-                        ON ABS(cb.avg_power_kw - t.avg_power) <= %s
+                        ON ABS(cb.avg_power_kw - t.avg_power) <= :tolerance
                     ORDER BY t.avg_power, random(), deviation_kw;
-                  """            
+                  """)            
 
             sim_start_dt = datetime.strptime(params['start_time'], '%Y-%m-%d %H:%M:%S')
             sim_end_dt = sim_start_dt + timedelta(seconds=float(params['simulation_time_s']))
 
-            with psycopg2.connect(**db) as conn:
-                with conn.cursor() as cur:
-                    cur.execute(sql, (split_loads, sim_start_dt.strftime('%Y-%m-%d %H:%M:%S'), sim_end_dt.strftime('%Y-%m-%d %H:%M:%S'), 0.5))  # 0.5 kW tolerance
-                    results = cur.fetchall()
+            db_url = f"postgresql://{db['user']}:{db['password']}@{db['host']}:{db['port']}/{db['dbname']}"
+            engine = create_engine(db_url)
+            with engine.connect() as conn:
+                results = conn.execute(sql, {
+                    "split_loads": split_loads,
+                    "start_time": sim_start_dt.strftime('%Y-%m-%d %H:%M:%S'),
+                    "end_time": sim_end_dt.strftime('%Y-%m-%d %H:%M:%S'),
+                    "tolerance": 0.5
+                }).fetchall()
 
             bldg_ids_list = [str(row[0]) for row in results]
             graph.nodes[bus]['connected_buildings_ids'] = bldg_ids_list
@@ -226,6 +231,8 @@ def run_simulation(params):
         "host": os.getenv("POSTGRES_DB_HOST", "103.0.2.7"),
         "port": int(os.getenv("POSTGRES_DB_PORT", "5433"))
     }
+    db_url = f"postgresql://{db['user']}:{db['password']}@{db['host']}:{db['port']}/{db['dbname']}"
+    engine = create_engine(db_url)
 
     net, graph = None, None
     if params['use_saved_network_if_exists']:
@@ -306,19 +313,19 @@ def run_simulation(params):
     result_writer = result_output_model.PostgresWriterModel(buff_size=int(params['step_size_s']))
 
     # Save grid version used in this simulation
-    sql = f"""UPDATE building_power.simulation_outputs
-              SET pandapower_grid_id = %s
+    sql = text("""UPDATE building_power.simulation_outputs
+              SET pandapower_grid_id = :grid_id
               WHERE simulation_output_id = (
                   SELECT simulation_output_id 
                   FROM building_power.simulation_outputs 
-                  WHERE parameters->>'network_id' = %s
+                  WHERE parameters->>'network_id' = :network_id
                   ORDER BY simulation_output_id DESC 
                   LIMIT 1
               );
-            """    
-    with psycopg2.connect(**db) as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (pandapower_grid_id, params['network_id']))  
+            """)        
+    with engine.connect() as conn:
+        conn.execute(sql, {"grid_id": pandapower_grid_id, "network_id": params['network_id']})
+        conn.commit()  
 
     grid = pp_sim.Grid(net=net)
     
