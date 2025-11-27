@@ -327,6 +327,7 @@ def run_simulation(params):
     buses = [e for e in grid.children if e.type == "Bus"] 
     lines = [e for e in grid.children if e.type == "Line"] 
     trafos = [e for e in grid.children if e.type == "Transformer"]
+    external_grid = [e for e in grid.children if e.type == "ExternalGrid"]
     generators = [e for e in grid.children if e.type == "StaticGen"]     
 
     #output load Powers
@@ -340,7 +341,8 @@ def run_simulation(params):
         world.connect(bus, result_writer, "P_b[MW]")    
         world.connect(bus, result_writer, "Vm_b[pu]")
         world.connect(bus, result_writer, "P_c[MW]")    
-        world.connect(bus, result_writer, "Vm_c[pu]")        
+        world.connect(bus, result_writer, "Vm_c[pu]") 
+        world.connect(bus, result_writer, "Unbalance[%]")        
         graph.nodes[bus.extra_info['index']]['bus_element'] = bus
         
     for trafo in trafos:
@@ -357,9 +359,19 @@ def run_simulation(params):
         world.connect(line, result_writer, "I_a_from[kA]")
         world.connect(line, result_writer, "I_b_from[kA]")
         world.connect(line, result_writer, "I_c_from[kA]")
+        world.connect(line, result_writer, "I_n_from[kA]")
         world.connect(line, result_writer, "Pl_a[MW]")
-        world.connect(line, result_writer, "Pl_b[MW]")
+        world.connect(line, result_writer, "Pl_b[MW]")        
         world.connect(line, result_writer, "Pl_c[MW]")
+        world.connect(line, result_writer, "Loading[%]") 
+        world.connect(line, result_writer, "Loading[%]") 
+    
+    for ext_grid in external_grid:
+        world.connect(ext_grid, result_writer, "P_a[MW]")            
+        world.connect(ext_grid, result_writer, "P_b[MW]")            
+        world.connect(ext_grid, result_writer, "P_c[MW]")    
+        
+        
         
         #world.connect(line, csv_writer, "Pin[MW]")
         # world.connect(line, csv_writer, "Pout[MW]")
@@ -414,7 +426,7 @@ def run_simulation(params):
                 #world.connect(house_model, result_writer, 'EnergyImported[MWh]')
                 #world.connect(house_model, result_writer, 'PVEnergyGeneration[MWh]')
                 #world.connect(house_model, result_writer, 'EnergyConsumption[MWh]')
-                world.connect(house_model, result_writer, 'SOC[percent]')
+                world.connect(house_model, result_writer, 'SOC[MWh]')
                 #world.connect(house_model, result_writer, 'BatteryEnergyStored[MWh]')
                 #world.connect(house_model, result_writer, 'BatteryEnergyConsumed[MWh]')
                 world.connect(house_model, result_writer, 'PVPowerGeneration[MW]')
