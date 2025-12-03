@@ -148,7 +148,7 @@ def distribute_loads_to_buses(net, graph, params, db):
             sql = text("""
                     WITH targets(avg_power) AS 
                     (
-                        SELECT unnest(:split_loads::float8[])
+                        SELECT unnest(:split_loads)
                     ), 
                     candidate_buildings AS 
                     (
