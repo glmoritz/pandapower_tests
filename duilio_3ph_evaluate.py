@@ -16,6 +16,7 @@ import networkx as nx
 import pandapower.networks as pn
 from simulation_worker.SimulationWorker import find_and_lock_param_file
 from create_random_network import generate_pandapower_net, load_network_from_database, save_network_to_database
+from generate_power_profile import distribute_loads_to_buses, apply_profile_to_graph, save_graph_metadata
 import time
 import random
 from pandapower.create import create_load
@@ -52,144 +53,7 @@ def getElementbyName(grid, name):
         if element.extra_info['name'] == name:
             return element
     return None    
-#matplotlib.use("Qt5Agg")  # Use "Qt5Agg" if you have PyQt5 installed
-
-def distribute_loads_to_buses(net, graph, params, db):
-    # Iterate through each transformer in the network
-    for idx, trafo_row in net.trafo.iterrows():
-        
-        # Get all the lv buses that are fed by this transformer
-        lv_buses = list(nx.descendants(graph, trafo_row['lv_bus']))
-
-        # Draw the total power of the loads on this branch
-        total_load_power = random.uniform(params['load_power_range_per_branch_kW'][0], 
-                                      params['load_power_range_per_branch_kW'][1])
-        
-        # Draw the total solar power of the PV systems on this branch
-        total_solar_power = random.uniform(params['solar_power_range_per_branch_kW'][0], 
-                                      params['solar_power_range_per_branch_kW'][1])
-        
-        total_storage_capacity = random.uniform(params['storage_capacity_range_per_branch_kWh'][0], 
-                                      params['storage_capacity_range_per_branch_kWh'][1])
-        
-        
-        load_buses = random.sample(lv_buses, random.randint(1, len(lv_buses)))
-
-        #distribute the load power to the buses
-        load_distribution = np.random.uniform(size=len(load_buses))  
-        bus_loads = (total_load_power/load_distribution.sum())*load_distribution
-
-        #distribute the PV generation to the buses
-        pv_distribution = np.random.uniform(size=len(load_buses)) 
-        storage_distribution = np.random.uniform(size=len(load_buses))
-
-        pv_peak_power = (pv_distribution/pv_distribution.sum())*total_solar_power
-        pv_storage_capacity = (storage_distribution/storage_distribution.sum())*total_storage_capacity        
-        
-        #connect the PV systems to the buses
-        for i, bus in enumerate(load_buses):           
-            initial_charge = random.uniform(params['initial_capacity_range'][0], params['initial_capacity_range'][1])
-        
-            #the maximum charge and discharge power of the storage system will be based on Tesla Powerwall 3
-            MaxChargePower_kW = (8.0/13.5)*pv_storage_capacity[i]  # 8 kW charge power, 13.5 kWh capacity
-            MaxDischargePower_kW = (11.5/13.5)*pv_storage_capacity[i]  # 11.5 kW rated power, 13.5 kWh capacity
-
-            #the maximum power per phase on single/double phase systems will be 10kWp
-            if pv_peak_power[i] < 10.0:
-                inverter_type = '1ph'
-            elif pv_peak_power[i] < 20.0:
-                inverter_type = random.choice(['1ph', '2ph'])
-            else:
-                inverter_type = '3ph'
-
-            household_params = {
-                "SolarPeakPower_MW": pv_peak_power[i]/1000,
-                "StorageCapacity_MWh": pv_storage_capacity[i]/1000,
-                "InitialSOC_percent": initial_charge,
-                "MaxChargePower_MW": MaxChargePower_kW/1000,
-                "MaxDischargePower_MW": MaxDischargePower_kW/1000,
-                "InverterType": inverter_type
-            }
-            graph.nodes[bus]['household_params'] = household_params
-
-            #connect the household inverter to the bus (in random phases)
-            inverter_phases = ['a', 'b', 'c']
-
-            if inverter_type == '1ph':
-                bus_phases = [random.choice(['a', 'b', 'c'])]                
-            elif inverter_type == '2ph':
-                bus_phases = random.sample(['a', 'b', 'c'], 2)                                                                
-            else:
-                bus_phases = ['a', 'b', 'c']
-
-            graph.nodes[bus]['inverter_connection_phases'] = bus_phases
-
-            #first I need to find a combination of buses that have this average power
-            if bus_loads[i] > 4: #our database has no loads with average power above 4kW
-                min_value_kw = 1.0
-                max_value_kw = 4.0
-                min_parts_count = int(bus_loads[i] / max_value_kw) + 1                
-                max_parts_count = int(bus_loads[i] / min_value_kw) 
-                parts_count = random.randint(min_parts_count, max_parts_count)
-                split_loads = [min_value_kw] * parts_count
-                
-                remainder = bus_loads[i] - sum(split_loads)
-                while remainder > 0:
-                    remainder_distribution_factors = np.random.uniform(size=len(split_loads))
-                    remainder_distribution = (remainder/np.sum(remainder_distribution_factors))*remainder_distribution_factors
-                    for j in range(len(split_loads)):
-                        if split_loads[j] + remainder_distribution[j] <= max_value_kw*1.1:
-                            split_loads[j] += remainder_distribution[j]
-                            remainder -= remainder_distribution[j]                
-            else:
-                split_loads = [bus_loads[i]]
-
-            #now execute a query to find buildings that have split_loads[i] as average power consumption
-            sql = text("""
-                    WITH targets(avg_power) AS 
-                    (
-                        SELECT unnest(:split_loads)
-                    ), 
-                    candidate_buildings AS 
-                    (
-                    SELECT 
-                        bldg_id,
-                        -- Convert kWh to kW by dividing by time fraction (0.25 for 15min intervals)
-                        -- Then average these power values over the period
-                        AVG(electricity_total_energy_consumption / 0.25) AS avg_power_kw
-                    FROM building_power.building_power
-                    WHERE electricity_total_energy_consumption IS NOT NULL
-                    AND sample_time >= :start_time
-                    AND sample_time <= :end_time
-                    GROUP BY bldg_id
-                    ) 
-                    SELECT DISTINCT ON (t.avg_power) 
-                        cb.bldg_id,
-                        t.avg_power, 
-                        cb.avg_power_kw, 
-                        ABS(cb.avg_power_kw - t.avg_power) AS deviation_kw 
-                        FROM targets t 
-                        JOIN candidate_buildings cb 
-                        ON ABS(cb.avg_power_kw - t.avg_power) <= :tolerance
-                    ORDER BY t.avg_power, random(), deviation_kw;
-                  """)            
-
-            sim_start_dt = datetime.strptime(params['start_time'], '%Y-%m-%d %H:%M:%S')
-            sim_end_dt = sim_start_dt + timedelta(seconds=float(params['simulation_time_s']))
-
-            db_url = f"postgresql://{db['user']}:{db['password']}@{db['host']}:{db['port']}/{db['dbname']}"
-            engine = create_engine(db_url)
-            with engine.connect() as conn:
-                results = conn.execute(sql, {
-                    "split_loads": split_loads,
-                    "start_time": sim_start_dt.strftime('%Y-%m-%d %H:%M:%S'),
-                    "end_time": sim_end_dt.strftime('%Y-%m-%d %H:%M:%S'),
-                    "tolerance": 0.5
-                }).fetchall()
-
-            bldg_ids_list = [str(row[0]) for row in results]
-            graph.nodes[bus]['connected_buildings_ids'] = bldg_ids_list
-            
+#matplotlib.use("Qt5Agg")  # Use "Qt5Agg" if you have PyQt5 installed           
 
 def run_simulation(params):
     # Simulator backends
@@ -265,14 +129,33 @@ def run_simulation(params):
         net.trafo['mag0_percent'] = 100
         net.trafo['mag0_rx'] = 0 
         net.trafo['si0_hv_partial'] = 0.9
-        net.trafo['vkr0_percent'] = net.trafo['vkr_percent'] 
-        distribute_loads_to_buses(net, graph, params, db)  
+        net.trafo['vkr0_percent'] = net.trafo['vkr_percent']         
         pandapower_grid_id = save_network_to_database(
             graph = graph,
             net= net,
             db_connection = db,
             grid_name = params['network_id'])             
         print(f"Saved new network '{params['network_id']}' to database.")
+
+    profile_loaded = False
+    if params['use_saved_power_profile_if_exists']:
+        profile_loaded = apply_profile_to_graph(
+            engine,
+            pandapower_grid_id,
+            params['power_profile_id'],
+            graph
+        )        
+        if profile_loaded:
+            print(f"Loaded existing power profile '{params['power_profile_id']}' from database.")
+        else:
+            print(f"Power profile '{params['power_profile_id']}' does not exist.")
+            
+    
+    if not profile_loaded:
+        print(f"Generating Power profile '{params['power_profile_id']}'.")
+        distribute_loads_to_buses(net, graph, params, db)  
+        save_graph_metadata(engine, pandapower_grid_id, params['power_profile_id'], graph)
+        print(f"Saved power profile '{params['power_profile_id']}' to database.")
     
     # Create PV system with certain configuration
     pv_sim = world.start(
@@ -376,43 +259,14 @@ def run_simulation(params):
     for ext_grid in external_grid:
         world.connect(ext_grid, result_writer, "P_a[MW]")            
         world.connect(ext_grid, result_writer, "P_b[MW]")            
-        world.connect(ext_grid, result_writer, "P_c[MW]")    
-        
-        
-        
-        #world.connect(line, csv_writer, "Pin[MW]")
-        # world.connect(line, csv_writer, "Pout[MW]")
-        # world.connect(line, csv_writer, "Pout[MW]")
-        # world.connect(line, csv_writer, "VmIn[pu]")
-        # world.connect(line, csv_writer, "VmOut[pu]")
-        # world.connect(line, csv_writer, "QIn[MVar]")
-        # world.connect(line, csv_writer, "QOut[MVar]")
+        world.connect(ext_grid, result_writer, "P_c[MW]")  
 
     for bus in buses:        
-        graph.nodes[bus.extra_info['index']]['bus_element'] = bus
-    
-    #connect charger csv file to charger connection
-    #world.connect(charger_model[0],charger1, ("P[MW]","P[MW]"))
-    
-    #world.connect(irr_model1, pv_model[0],"DNI[W/m2]")
-                    
-    # world.connect(
-    #                     pv_model[0],
-    #                     csv_writer,
-    #                     "P[MW]",
-    #                 )
-    
-    # Run simulation
+        graph.nodes[bus.extra_info['index']]['bus_element'] = bus    
 
-    #connect charger csv file to charger connection
-    #params['solar_power_range_per_branch_kW']
-
-    #"solar_power_range_per_branch_kW": [0.5, 100], 
     
     # For each branch add the loads as specified in the parameters
-
     #first, get the roots of all branches (the children of the root bus)
-
     for trafo in trafos:
         # Get all the lv buses that are fed by this transformer
         lv_buses = list(nx.descendants(graph, net.trafo.at[trafo.extra_info['index'], 'lv_bus']))
@@ -423,7 +277,18 @@ def run_simulation(params):
             if 'household_params' in graph.nodes[bus]:
                 #plot solar panel power            
                 irradiation_model = irradiation_sim.SolarIrradiation(latitude=graph.nodes[bus]['latlon'][0], longitude=graph.nodes[bus]['latlon'][1])
-                house_model = household_sim.HouseholdProducer(**graph.nodes[bus]['household_params'])
+                
+                # Extract only the parameters expected by HouseholdProducer constructor
+                hp = graph.nodes[bus]['household_params']
+                household_constructor_params = {
+                    'SolarPeakPower_MW': hp['SolarPeakPower_MW'],
+                    'StorageCapacity_MWh': hp['StorageCapacity_MWh'],
+                    'InitialSOC_percent': hp['InitialSOC_percent'],
+                    'MaxChargePower_MW': hp['MaxChargePower_MW'],
+                    'MaxDischargePower_MW': hp['MaxDischargePower_MW'],
+                    'InverterType': hp['InverterType']
+                }
+                house_model = household_sim.HouseholdProducer(**household_constructor_params)
                 #connect the irradiance model to the household model
                 world.connect(irradiation_model, result_writer, "DNI[W/m2]")
                 world.connect(irradiation_model, house_model, ("DNI[W/m2]","Irradiance[W/m2]"))
@@ -449,7 +314,7 @@ def run_simulation(params):
                         world.connect(house_model, result_writer, f'P_{bus_phase}_load[MW]')            
 
                 if 'connected_buildings_ids' in graph.nodes[bus]: 
-                    bldg_ids = ', '.join(graph.nodes[bus]['connected_buildings_ids'])
+                    bldg_ids = ', '.join([str(i) for i in graph.nodes[bus]['connected_buildings_ids']])
 
                     #conect the household to the power consumption of the bus            
                     interval_str = f'{params['step_size_s']} seconds'            

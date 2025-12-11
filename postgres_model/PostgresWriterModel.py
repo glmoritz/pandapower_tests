@@ -93,8 +93,13 @@ class PostgresWriterModel(mosaik_api.Simulator):
         self.write_to_db = False
         self.simulation_id = None
         self.variable_map = {}  # maps var name -> variable_id
+        self.step_index = 0  # Track simulation step index
+        self.db_params = None  # Store DB connection params for refresh thread
 
         self.output_csv = True
+        
+        # Debug
+        self.debug = False
 
         # Threading
         self.flush_queue = queue.Queue()
@@ -122,6 +127,7 @@ class PostgresWriterModel(mosaik_api.Simulator):
 
         # DB connection if enabled
         if self.write_to_db and db_connection:
+            self.db_params = db_connection  # Store for later use in refresh thread
             db_url = f"postgresql://{db_connection['user']}:{db_connection['password']}@{db_connection['host']}:{db_connection['port']}/{db_connection['dbname']}"
             self.engine = create_engine(db_url)
             self.conn = self.engine.connect()
@@ -152,14 +158,21 @@ class PostgresWriterModel(mosaik_api.Simulator):
 
     def _register_variables(self, var_names):
         """Ensure variables exist in DB and return their IDs in batch."""
+        import time
+        start_time = time.time()
+        
         # First check which variables we already know
         new_vars = [v for v in var_names if v not in self.variable_map]
+        
+        if self.debug:
+            print(f"[_register_variables] Total vars: {len(var_names)}, New vars to register: {len(new_vars)}, Cached vars: {len(var_names) - len(new_vars)}")
         
         if not new_vars:
             return [self.variable_map[v] for v in var_names]
         
-        # Insert variables one by one and collect results
-        for var_name in new_vars:
+        # Insert variables one by one (batch insert with RETURNING doesn't work well in SQLAlchemy)
+        insert_start = time.time()
+        for i, var_name in enumerate(new_vars):
             extra_info = parse_variable_name(var_name)
             query = text("""
                 INSERT INTO building_power.variable(
@@ -180,34 +193,49 @@ class PostgresWriterModel(mosaik_api.Simulator):
             
             var_id, var_name_ret = result.fetchone()
             self.variable_map[var_name_ret] = var_id
+            
+            if self.debug and (i + 1) % 100 == 0:
+                print(f"  [_register_variables] Inserted {i + 1}/{len(new_vars)} variables...")
         
+        if self.debug:
+            print(f"  [_register_variables] Insert time: {time.time() - insert_start:.2f}s")
+        
+        commit_start = time.time()
         self.conn.commit()
         
-        # For any vars that weren't inserted (due to concurrent inserts), get their existing IDs
-        missing_vars = set(new_vars) - set(self.variable_map.keys())
-        if missing_vars:
-            query = text("""
-                SELECT variable_id, variable_name 
-                FROM building_power.variable
-                WHERE variable_name = ANY(:var_names)
-            """)
-            result = self.conn.execute(query, {"var_names": list(missing_vars)})
-            
-            for var_id, var_name in result.fetchall():
-                self.variable_map[var_name] = var_id
+        if self.debug:
+            print(f"  [_register_variables] Commit time: {time.time() - commit_start:.2f}s")
+            print(f"[_register_variables] Total time: {time.time() - start_time:.2f}s, Cache now has {len(self.variable_map)} variables")
         
         return [self.variable_map[v] for v in var_names]
 
     def _flush_to_db(self, df):
         """Insert DataFrame rows into timeseries hypertable using batch processing."""
+        import time
+        start_time = time.time()
+        
+        # Extract step_index from DataFrame if present
+        if 'step_index' in df.columns:
+            step_index = df['step_index'].iloc[0] if len(df) > 0 else None
+            # Remove step_index from columns to process
+            df = df.drop(columns=['step_index'])
+        else:
+            step_index = None
+        
         # Get all unique variable names in this batch
         var_names = list(df.columns)
+        if self.debug:
+            print(f"[_flush_to_db] Starting flush for {len(df)} rows x {len(var_names)} variables = {len(df) * len(var_names)} potential records (step_index={step_index})")
         
         # Batch register variables and get their IDs
+        reg_start = time.time()
         var_ids = self._register_variables(var_names)
         var_id_map = dict(zip(var_names, var_ids))
+        if self.debug:
+            print(f"  [_flush_to_db] Variable registration took {time.time() - reg_start:.2f}s")
         
         # Prepare timeseries records
+        prep_start = time.time()
         records = []
         for ts, row in df.iterrows():
             for col, value in row.items():
@@ -216,19 +244,56 @@ class PostgresWriterModel(mosaik_api.Simulator):
                 records.append({
                     "variable_id": var_id_map[col],
                     "ts": ts,
-                    "quantity": float(value)
+                    "quantity": float(value),
+                    "step_index": step_index
                 })
         
-        if records:
-            # Insert records in batches
-            query = text("INSERT INTO building_power.output_timeseries (variable_id, ts, quantity) VALUES (:variable_id, :ts, :quantity);")
-            self.conn.execute(query, records)
+        if self.debug:
+            print(f"  [_flush_to_db] Prepared {len(records)} non-null records in {time.time() - prep_start:.2f}s")
         
+        if records:
+            # Insert records using bulk insert for better performance
+            insert_start = time.time()
+            
+            if self.debug:
+                print(f"  [_flush_to_db] Bulk inserting {len(records)} records...")
+            
+            # Get raw DBAPI connection for execute_values
+            raw_conn = self.conn.connection
+            cursor = raw_conn.cursor()
+            
+            # Convert records to tuples for psycopg2 execute_values
+            values = [(r['variable_id'], r['ts'], r['quantity'], int(r['step_index'])) for r in records]
+            
+            # Use execute_values for maximum performance (batched multi-row INSERT)
+            from psycopg2.extras import execute_values
+            execute_values(
+                cursor,
+                "INSERT INTO building_power.output_timeseries (variable_id, ts, quantity, step_index) VALUES %s",
+                values,
+                page_size=1000  # Insert 1000 rows at a time
+            )
+            cursor.close()
+            
+            # IMPORTANT: Commit on the raw connection since we used the raw cursor
+            raw_conn.commit()
+            
+            if self.debug:
+                print(f"  [_flush_to_db] Bulk insert time: {time.time() - insert_start:.2f}s ({len(records)/max(0.001, time.time() - insert_start):.0f} records/sec)")
+        
+        commit_start = time.time()
         self.conn.commit()
+        if self.debug:
+            print(f"  [_flush_to_db] Commit time: {time.time() - commit_start:.2f}s")
+            print(f"[_flush_to_db] Total flush time: {time.time() - start_time:.2f}s")
+            print()
 
     def _flush_worker(self):
         """Background thread that flushes queued DataFrames to DB."""
-        first_flush = True        
+        first_flush = True
+        flush_count = 0
+        import time
+        
         while not self.stop_event.is_set() or not self.flush_queue.empty():
             try:
                 df = self.flush_queue.get(timeout=0.5)
@@ -237,19 +302,34 @@ class PostgresWriterModel(mosaik_api.Simulator):
 
             if df is None:
                 # Signal to exit
+                if self.debug:
+                    print(f"[_flush_worker] Received exit signal. Total flushes processed: {flush_count}")
                 break
 
+            flush_count += 1
+            worker_start = time.time()
+            if self.debug:
+                print(f"\n[_flush_worker] Flush #{flush_count} - Queue size: {self.flush_queue.qsize()}")
+
             if self.output_csv:
+                csv_start = time.time()
                 df.to_csv(self.output_file, mode='w' if first_flush else 'a', header=first_flush,
                           date_format=self.date_format, na_rep=self.nan_representation)
+                if self.debug:
+                    print(f"  [_flush_worker] CSV write time: {time.time() - csv_start:.2f}s")
                 first_flush = False
 
             if self.write_to_db:
                 self._flush_to_db(df)
 
+            if self.debug:
+                print(f"[_flush_worker] Flush #{flush_count} total time: {time.time() - worker_start:.2f}s")
             self.flush_queue.task_done()
 
     def step(self, time, inputs, max_advance):
+        import time as time_module
+        step_start = time_module.time()
+        
         current_date = (self.start_date
                         + pd.Timedelta(time * self.time_resolution, unit='seconds'))
 
@@ -257,6 +337,10 @@ class PostgresWriterModel(mosaik_api.Simulator):
         for attr, values in inputs.get(self.eid, {}).items():
             for src, value in values.items():
                 data_dict[f'{src}-{attr}'] = [value]
+        
+        num_inputs = len(inputs.get(self.eid, {}))
+        num_columns = len(data_dict) - 1  # Exclude 'date' column
+        
         if self.attrs:
             df_data = pd.DataFrame(data_dict, columns=self.attrs)
             df_data.set_index('date', inplace=True)
@@ -266,24 +350,126 @@ class PostgresWriterModel(mosaik_api.Simulator):
             df_data.set_index('date', inplace=True)
 
         if time == 0:
+            if self.debug:
+                print(f"[step] t={time}: First step - storing initial dataframe with {num_columns} columns (step_index={self.step_index})")
             self.df = df_data            
         elif time > 0:
-            self.flush_queue.put(df_data.copy())
-            self.df = pd.concat([self.df, df_data])                       
-            
+            queue_before = self.flush_queue.qsize()
+            # Add step_index as a column to the DataFrame
+            df_with_step = df_data.copy()
+            df_with_step['step_index'] = self.step_index
+            self.flush_queue.put(df_with_step)
+            queue_after = self.flush_queue.qsize()
+            if self.debug:
+                print(f"[step] t={time}: Added batch to queue (columns={num_columns}, queue: {queue_before}->{queue_after}, step_index={self.step_index})")
+            self.df = pd.concat([self.df, df_data])
+        
+        # Increment step index for next call
+        self.step_index += 1
+        
+        step_time = time_module.time() - step_start
+        if self.debug and (time % 10 == 0 or step_time > 0.1):  # Print every 10 steps or if step takes >100ms
+            print(f"[step] t={time}: Step completed in {step_time:.3f}s (inputs={num_inputs}, columns={num_columns})")
                         
-
         return None
 
-    def finalize(self):      
+    def _refresh_continuous_aggregate(self):
+        """Background thread to refresh continuous aggregate after simulation ends."""
+        import time
+        import psycopg2
+        
+        try:
+            if self.debug:
+                print(f"[_refresh_continuous_aggregate] Starting continuous aggregate refresh...")
+            
+            # Create a completely fresh psycopg2 connection with autocommit
+            raw_conn = psycopg2.connect(
+                host=self.db_params['host'],
+                port=self.db_params['port'],
+                dbname=self.db_params['dbname'],
+                user=self.db_params['user'],
+                password=self.db_params['password']
+            )
+            raw_conn.autocommit = True
+            
+            refresh_start = time.time()
+            
+            # Get min and max timestamps from this simulation
+            cursor = raw_conn.cursor()
+            cursor.execute("""
+                SELECT 
+                    MIN(ts) as min_ts,
+                    MAX(ts) as max_ts
+                FROM building_power.output_timeseries ot
+                JOIN building_power.variable v ON v.variable_id = ot.variable_id
+                WHERE v.simulation_output_id = %s
+            """, (self.simulation_id,))
+            
+            result = cursor.fetchone()
+            min_ts, max_ts = result[0], result[1]
+            
+            if min_ts is None or max_ts is None:
+                if self.debug:
+                    print(f"[_refresh_continuous_aggregate] No data found for simulation {self.simulation_id}, skipping refresh")
+                cursor.close()
+                raw_conn.close()
+                return
+            
+            if self.debug:
+                print(f"[_refresh_continuous_aggregate] Refreshing from {min_ts} to {max_ts}")
+            
+            # Call refresh_continuous_aggregate
+            cursor.execute(f"""
+                CALL refresh_continuous_aggregate(
+                    'building_power.power_15min_by_variable',
+                    '{min_ts}'::timestamptz,
+                    '{max_ts}'::timestamptz
+                )
+            """)
+            
+            if self.debug:
+                print(f"[_refresh_continuous_aggregate] Refresh completed in {time.time() - refresh_start:.2f}s")
+            
+            cursor.close()
+            raw_conn.close()
+                
+        except Exception as e:
+            print(f"[_refresh_continuous_aggregate] Error during refresh: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def finalize(self):
+        import time
+        finalize_start = time.time()
+        queue_size = self.flush_queue.qsize()
+        if self.debug:
+            print(f"\n[finalize] Starting finalization. Queue size: {queue_size} batches waiting to be flushed")
 
         # Signal flush thread to stop
         self.stop_event.set()
         self.flush_queue.put(None)  # Sentinel
+        
+        if self.debug:
+            print(f"[finalize] Waiting for flush thread to complete {queue_size} remaining batches...")
         self.flush_thread.join()
+        if self.debug:
+            print(f"[finalize] Flush thread completed all {queue_size} batches in {time.time() - finalize_start:.2f}s")
+
+        # Start continuous aggregate refresh in background thread (daemon=True allows program to exit)
+        if self.write_to_db and self.engine:
+            refresh_thread = threading.Thread(target=self._refresh_continuous_aggregate, daemon=False)
+            refresh_thread.start()
+            if self.debug:
+                print(f"[finalize] Continuous aggregate refresh started in background thread (non-daemon, will complete even if program tries to exit)")
 
         if self.write_to_db and self.conn:
+            close_start = time.time()
             self.conn.close()
+            if self.debug:
+                print(f"[finalize] Connection closed in {time.time() - close_start:.2f}s")
+        
+        if self.debug:
+            print(f"[finalize] Total finalization time: {time.time() - finalize_start:.2f}s")
 
 
 if __name__ == '__main__':
