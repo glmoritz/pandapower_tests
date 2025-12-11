@@ -1,28 +1,16 @@
 import mosaik
-import mosaik.util
-#from pv_configurations import generate_configurations, Scenarios
-import simbench
-import pandapower.plotting as plot
-import matplotlib.pyplot as plt
-import pandapower as pp
-import pandas as pd
-import matplotlib
-import nest_asyncio
 import numpy as np
-import re
 import sys
 import os
 import networkx as nx
-import pandapower.networks as pn
 from simulation_worker.SimulationWorker import find_and_lock_param_file
 from create_random_network import generate_pandapower_net, load_network_from_database, save_network_to_database
 from generate_power_profile import distribute_loads_to_buses, apply_profile_to_graph, save_graph_metadata
 import time
-import random
-from pandapower.create import create_load
 from datetime import datetime, timedelta
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
+from numpy.random import SeedSequence, default_rng
 load_dotenv()
 
 # Add local-mosaik-pandapower-2.src.mosaik_components to Python path
@@ -42,18 +30,15 @@ postgres_module_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '
 if postgres_module_path not in sys.path:
     sys.path.insert(0, postgres_module_path)
 
-import irradiation_model
+def get_rng_for_component(root_ss: np.random.SeedSequence, key):
+    """Create a reproducible RNG for a component using a deterministic key."""
+    key_int = abs(hash(key)) % (2**32)
+    child_ss = np.random.SeedSequence(
+        entropy=root_ss.entropy,
+        spawn_key=(key_int,)
+    )
+    return np.random.default_rng(child_ss)
 
-
-def getElementbyName(grid, name):
-    """
-    Get the element by name from the DataFrame.
-    """
-    for element in grid.children:
-        if element.extra_info['name'] == name:
-            return element
-    return None    
-#matplotlib.use("Qt5Agg")  # Use "Qt5Agg" if you have PyQt5 installed           
 
 def run_simulation(params):
     # Simulator backends
@@ -84,10 +69,10 @@ def run_simulation(params):
         }
     }    
 
-    world = mosaik.World(SIM_CONFIG)
+    #start mosaik simulation world
+    world = mosaik.World(SIM_CONFIG)   
 
-    load_dotenv()
-
+    # Database connection
     db = {
         "dbname": os.getenv("POSTGRES_DB_NAME", "duilio"),
         "user": os.getenv("POSTGRES_DB_USER", "root"),
@@ -97,7 +82,20 @@ def run_simulation(params):
     }
     db_url = f"postgresql://{db['user']}:{db['password']}@{db['host']}:{db['port']}/{db['dbname']}"
     engine = create_engine(db_url)
+    
+    # Initialize random seed and create independent RNG streams
+    # Using SeedSequence ensures each component gets its own independent, reproducible RNG
+    master_seed = params.get('random_seed', 1234567890)
+    root_seed_sequence = np.random.SeedSequence(master_seed)   
+    
+    
+    #deal with the random number generators for each component
+    rng_network_generation = get_rng_for_component(root_seed_sequence, "NetworkGeneration")
+    rng_power_profile = get_rng_for_component(root_seed_sequence, "PowerProfile")  
+    
+    print(f"Initialized simulation with master seed: {master_seed}")
 
+    #Load the simulation network from database or create a new one
     net, graph = None, None
     if params['use_saved_network_if_exists']:
         try:
@@ -115,7 +113,8 @@ def run_simulation(params):
             ForkLengthRange=params['fork_length_range'],
             LineBusesRange=params['line_buses_range'],
             LineForksRange=params['line_forks_range'],
-            mv_bus_coordinates=(float(params['mv_bus_latitude']),float(params['mv_bus_longitude']))
+            mv_bus_coordinates=(float(params['mv_bus_latitude']),float(params['mv_bus_longitude'])),
+            rng=rng_network_generation  # Pass independent RNG for network generation
         )
         net.ext_grid['r0x0_max'] = 5.0
         net.ext_grid['x0x_max'] = 5.0
@@ -153,7 +152,7 @@ def run_simulation(params):
     
     if not profile_loaded:
         print(f"Generating Power profile '{params['power_profile_id']}'.")
-        distribute_loads_to_buses(net, graph, params, db)  
+        distribute_loads_to_buses(net, graph, params, db, rng=rng_power_profile)  # Pass independent RNG for power profile
         save_graph_metadata(engine, pandapower_grid_id, params['power_profile_id'], graph)
         print(f"Saved power profile '{params['power_profile_id']}' to database.")
     
@@ -163,14 +162,29 @@ def run_simulation(params):
                         start_date=params['start_time'],
                         step_size=int(params['step_size_s']))
     
-    #Irradiation model
-    irradiation_sim = world.start("SolarIrradiation", sim_start=params['start_time'], time_step=int(params['step_size_s']), date_format="%Y-%m-%d %H:%M:%S", type="time-based")
+    #Irradiation model - pass seed derived from independent child RNG
+    # Convert child_seed to integer for mosaik compatibility    
+    irradiation_sim = world.start("SolarIrradiation", 
+                                   sim_start=params['start_time'], 
+                                   time_step=int(params['step_size_s']), 
+                                   date_format="%Y-%m-%d %H:%M:%S", 
+                                   type="time-based",
+                                   master_seed_sequence=root_seed_sequence
+                                )
 
     #Household model
-    household_sim = world.start("HouseholdProducer", sim_start=params['start_time'], time_step=int(params['step_size_s']), date_format="%Y-%m-%d %H:%M:%S", type="hybrid")    
+    household_sim = world.start("HouseholdProducer",
+                                 sim_start=params['start_time'],
+                                 time_step=int(params['step_size_s']),
+                                 date_format="%Y-%m-%d %H:%M:%S",
+                                 type="hybrid"
+                                )    
 
     #Instantiate the power network    
-    pp_sim = world.start("Pandapower", step_size=int(params['step_size_s']), asymmetric_flow=True)
+    pp_sim = world.start("Pandapower",
+                         step_size=int(params['step_size_s']), 
+                         asymmetric_flow=True
+                        )
  
     #Power Consumption Model    
     sim_start_dt = datetime.strptime(params['start_time'], '%Y-%m-%d %H:%M:%S')
@@ -193,7 +207,10 @@ def run_simulation(params):
                                             output_csv=True,
                                             output_file=f'{params['results_dir']}/{params['output_file']}',
                                             time_resolution=1)                                              
-    result_writer = result_output_model.PostgresWriterModel(buff_size=int(params['step_size_s']))
+    
+    result_writer = result_output_model.PostgresWriterModel(
+                                            buff_size=int(params['step_size_s'])
+                                        )
 
     # Save grid version used in this simulation
     sql = text("""UPDATE building_power.simulation_outputs
@@ -276,7 +293,10 @@ def run_simulation(params):
 
             if 'household_params' in graph.nodes[bus]:
                 #plot solar panel power            
-                irradiation_model = irradiation_sim.SolarIrradiation(latitude=graph.nodes[bus]['latlon'][0], longitude=graph.nodes[bus]['latlon'][1])
+                irradiation_model = irradiation_sim.SolarIrradiation(
+                    latitude=graph.nodes[bus]['latlon'][0],
+                    longitude=graph.nodes[bus]['latlon'][1]
+                    )
                 
                 # Extract only the parameters expected by HouseholdProducer constructor
                 hp = graph.nodes[bus]['household_params']
@@ -289,6 +309,7 @@ def run_simulation(params):
                     'InverterType': hp['InverterType']
                 }
                 house_model = household_sim.HouseholdProducer(**household_constructor_params)
+
                 #connect the irradiance model to the household model
                 world.connect(irradiation_model, result_writer, "DNI[W/m2]")
                 world.connect(irradiation_model, house_model, ("DNI[W/m2]","Irradiance[W/m2]"))
@@ -331,7 +352,6 @@ def run_simulation(params):
                             """
 
                     power_model = power_consumption_sim.PostgresReader(query=[sql_query])
-
                     world.connect(power_model, house_model, ("Power[kW]","PowerConsumption[MW]"), transform=lambda kw_val: kw_val / 1000) # Convert kW to MW
                     world.connect(power_model, result_writer, 'Power[kW]')            
                     

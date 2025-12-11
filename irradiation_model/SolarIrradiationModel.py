@@ -1,3 +1,4 @@
+from matplotlib.pylab import SeedSequence
 import pandas as pd
 import pvlib
 import numpy as np
@@ -28,7 +29,7 @@ META: Meta = {
     "models": {
         "SolarIrradiation": {
             "public": True,
-            "params": ['latitude', 'longitude'],
+            "params": ['latitude', 'longitude', 'master_seed_sequence'],  
             "trigger": [],
             "persistent": ['DNI[W/m2]', 'cloudiness', 'cloud_state'],
             "non-trigger": [],
@@ -50,6 +51,7 @@ class SolarIrradiationModel(mosaik_api.Simulator):
         self.time_res = None 
         self.entities = {}
         self.results = {}
+        self.master_seed_sequence = None  # Will be set during init
 
         self.start_date = None
         self.cloud_states = [0, 1, 2]
@@ -62,7 +64,7 @@ class SolarIrradiationModel(mosaik_api.Simulator):
         self.results = []
     
     @override    
-    def init(self, sid, time_resolution, time_step, sim_start, date_format=None, type="time-based"):
+    def init(self, sid, time_resolution, time_step, sim_start, date_format=None, type="time-based", master_seed_sequence=None):
         self.type = type
         self.time_step = time_step
         if self.type != "time-based":
@@ -71,7 +73,12 @@ class SolarIrradiationModel(mosaik_api.Simulator):
         self.time_res = pd.Timedelta(time_resolution, unit='seconds')
         self.start_date = pd.to_datetime(sim_start, format=date_format)
         
-
+        # Initialize RNG with provided seed for reproducibility
+        if master_seed_sequence is not None:
+            self.master_seed_sequence = master_seed_sequence            
+        else:
+            self.master_seed_sequence = np.random.SeedSequence() 
+            print("WARNING: SolarIrradiationModel initialized without seed - results will not be reproducible!")        
         return self.meta
 
     @override
@@ -89,9 +96,18 @@ class SolarIrradiationModel(mosaik_api.Simulator):
         entities = []
         for i in range(num):
             eid = f'{self.eid_prefix}_{len(self.entities)+i}'
+            #this will guarantee independent RNG streams per entity
+            key_int = abs(hash(eid)) % (2**32)
+            entity_ss = SeedSequence(
+                entropy=self.master_seed_sequence.entropy,
+                spawn_key=(key_int,)
+            )
+            entity_rng = np.random.default_rng(entity_ss)
             self.entities[eid] = {
                 'location': pvlib.location.Location(params['latitude'][i], params['longitude'][i]),                
-                'cloud_state': np.random.choice(self.cloud_states),
+                'entity_seed_sequence': entity_ss,
+                'rng': entity_rng,  # Independent RNG per entity
+                'cloud_state': entity_rng.choice(self.cloud_states),  # Use entity-specific RNG
                 'time': 0
             }
             entities.append({'eid': eid, 'type': model})
@@ -120,7 +136,7 @@ class SolarIrradiationModel(mosaik_api.Simulator):
 
             # Markov cloudiness model with n-step transition
             current_state = entity['cloud_state']
-            next_state = np.random.choice(self.cloud_states, p=P_n[current_state])
+            next_state = self.entities[eid]['rng'].choice(self.cloud_states, p=P_n[current_state])  
             entity['cloud_state'] = next_state
             cloudiness = self.cloudiness_values[next_state]
 

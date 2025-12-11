@@ -1,8 +1,6 @@
 import pandapower as pp
 import pandas as pd
-import random
 from enum import Enum
-import random
 import math
 from shapely.geometry import Point as ShapelyPoint, LineString, MultiLineString, MultiPoint as ShapelyMultipoint
 from shapely.strtree import STRtree
@@ -21,7 +19,23 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import create_engine, text
 
 
-def distribute_loads_to_buses(net, graph, params, db):
+def distribute_loads_to_buses(net, graph, params, db, rng=None):
+    """
+    Distribute loads, PV systems, and storage to buses in the network.
+    
+    Args:
+        net: Pandapower network
+        graph: NetworkX graph representation
+        params: Simulation parameters dictionary
+        db: Database connection parameters
+        rng: numpy.random.Generator instance for reproducible randomness.
+             If None, creates a new unseeded generator (not recommended).
+    """
+    if rng is None:
+        # Fallback for backward compatibility, but not recommended
+        rng = np.random.default_rng()
+        print("WARNING: distribute_loads_to_buses called without RNG - results will not be reproducible!")
+    
     # Iterate through each transformer in the network
     for idx, trafo_row in net.trafo.iterrows():
         
@@ -29,33 +43,34 @@ def distribute_loads_to_buses(net, graph, params, db):
         lv_buses = list(nx.descendants(graph, trafo_row['lv_bus']))
 
         # Draw the total power of the loads on this branch
-        total_load_power = random.uniform(params['load_power_range_per_branch_kW'][0], 
+        total_load_power = rng.uniform(params['load_power_range_per_branch_kW'][0], 
                                       params['load_power_range_per_branch_kW'][1])
         
         # Draw the total solar power of the PV systems on this branch
-        total_solar_power = random.uniform(params['solar_power_range_per_branch_kW'][0], 
+        total_solar_power = rng.uniform(params['solar_power_range_per_branch_kW'][0], 
                                       params['solar_power_range_per_branch_kW'][1])
         
-        total_storage_capacity = random.uniform(params['storage_capacity_range_per_branch_kWh'][0], 
+        total_storage_capacity = rng.uniform(params['storage_capacity_range_per_branch_kWh'][0], 
                                       params['storage_capacity_range_per_branch_kWh'][1])
         
-        
-        load_buses = random.sample(lv_buses, random.randint(1, len(lv_buses)))
+        # Select random number of buses and which buses get loads
+        num_load_buses = rng.integers(1, len(lv_buses) + 1)  # +1 because high is exclusive
+        load_buses = rng.choice(lv_buses, size=num_load_buses, replace=False).tolist()
 
         #distribute the load power to the buses
-        load_distribution = np.random.uniform(size=len(load_buses))  
+        load_distribution = rng.uniform(size=len(load_buses))  
         bus_loads = (total_load_power/load_distribution.sum())*load_distribution
 
         #distribute the PV generation to the buses
-        pv_distribution = np.random.uniform(size=len(load_buses)) 
-        storage_distribution = np.random.uniform(size=len(load_buses))
+        pv_distribution = rng.uniform(size=len(load_buses)) 
+        storage_distribution = rng.uniform(size=len(load_buses))
 
         pv_peak_power = (pv_distribution/pv_distribution.sum())*total_solar_power
         pv_storage_capacity = (storage_distribution/storage_distribution.sum())*total_storage_capacity        
         
         #connect the PV systems to the buses
         for i, bus in enumerate(load_buses):           
-            initial_charge = random.uniform(params['initial_capacity_range'][0], params['initial_capacity_range'][1])
+            initial_charge = rng.uniform(params['initial_capacity_range'][0], params['initial_capacity_range'][1])
         
             #the maximum charge and discharge power of the storage system will be based on Tesla Powerwall 3
             MaxChargePower_kW = (8.0/13.5)*pv_storage_capacity[i]  # 8 kW charge power, 13.5 kWh capacity
@@ -65,7 +80,7 @@ def distribute_loads_to_buses(net, graph, params, db):
             if pv_peak_power[i] < 10.0:
                 inverter_type = '1ph'
             elif pv_peak_power[i] < 20.0:
-                inverter_type = random.choice(['1ph', '2ph'])
+                inverter_type = rng.choice(['1ph', '2ph'])
             else:
                 inverter_type = '3ph'
 
@@ -84,9 +99,9 @@ def distribute_loads_to_buses(net, graph, params, db):
             inverter_phases = ['a', 'b', 'c']
 
             if inverter_type == '1ph':
-                bus_phases = [random.choice(['a', 'b', 'c'])]                
+                bus_phases = [rng.choice(['a', 'b', 'c'])]                
             elif inverter_type == '2ph':
-                bus_phases = random.sample(['a', 'b', 'c'], 2)                                                                
+                bus_phases = rng.choice(['a', 'b', 'c'], size=2, replace=False).tolist()                                                                
             else:
                 bus_phases = ['a', 'b', 'c']
 
@@ -98,12 +113,12 @@ def distribute_loads_to_buses(net, graph, params, db):
                 max_value_kw = 4.0
                 min_parts_count = int(bus_loads[i] / max_value_kw) + 1                
                 max_parts_count = int(bus_loads[i] / min_value_kw) 
-                parts_count = random.randint(min_parts_count, max_parts_count)
+                parts_count = rng.integers(min_parts_count, max_parts_count + 1)  # +1 because high is exclusive
                 split_loads = [min_value_kw] * parts_count
                 
                 remainder = bus_loads[i] - sum(split_loads)
                 while remainder > 0:
-                    remainder_distribution_factors = np.random.uniform(size=len(split_loads))
+                    remainder_distribution_factors = rng.uniform(size=len(split_loads))
                     remainder_distribution = (remainder/np.sum(remainder_distribution_factors))*remainder_distribution_factors
                     for j in range(len(split_loads)):
                         if split_loads[j] + remainder_distribution[j] <= max_value_kw*1.1:
