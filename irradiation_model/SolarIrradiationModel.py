@@ -3,6 +3,7 @@ import pandas as pd
 import pvlib
 import numpy as np
 from datetime import datetime, timedelta
+import hashlib
 
 import mosaik_api_v3 as mosaik_api
 from typing_extensions import override
@@ -29,7 +30,7 @@ META: Meta = {
     "models": {
         "SolarIrradiation": {
             "public": True,
-            "params": ['latitude', 'longitude', 'master_seed_sequence'],  
+            "params": ['latitude', 'longitude', 'master_seed_sequence', 'Index'],  
             "trigger": [],
             "persistent": ['DNI[W/m2]', 'cloudiness', 'cloud_state'],
             "non-trigger": [],
@@ -95,12 +96,15 @@ class SolarIrradiationModel(mosaik_api.Simulator):
         
         entities = []
         for i in range(num):
-            eid = f'{self.eid_prefix}_{len(self.entities)+i}'
-            #this will guarantee independent RNG streams per entity
-            key_int = abs(hash(eid)) % (2**32)
+            eid = f'{self.eid_prefix}_{params.get("Index", i)}'
+            if eid in self.entities:
+                raise ValueError(f'Entity ID "{eid}" already exists.')
+            #this will guarantee independent RNG streams per entity             
+            h = hashlib.sha256(str(eid).encode()).digest()
+            key_int = int.from_bytes(h[:4], 'little')   # 32-bit int                
             entity_ss = SeedSequence(
                 entropy=self.master_seed_sequence.entropy,
-                spawn_key=(key_int,)
+                spawn_key=(key_int,len(self.entities)+i)
             )
             entity_rng = np.random.default_rng(entity_ss)
             self.entities[eid] = {

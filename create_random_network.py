@@ -322,11 +322,32 @@ def load_network_from_database(db_connection, network_name):
 def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,                            
                             ForkLengthRange, LineBusesRange, LineForksRange,
                             mv_bus_coordinates=(0.0, 0.0),
-                            ):    
+                            rng=None
+                            ):
+    """
+    Generate a random pandapower network.
+    
+    Args:
+        CommercialRange: Tuple (min, max) for number of commercial transformers
+        IndustrialRange: Tuple (min, max) for number of industrial transformers
+        ResidencialRange: Tuple (min, max) for number of residential transformers
+        ForkLengthRange: Tuple (min, max) for fork lengths
+        LineBusesRange: Tuple (min, max) for number of buses per line
+        LineForksRange: Tuple (min, max) for number of forks per line
+        mv_bus_coordinates: Tuple (lat, lon) for MV bus location
+        rng: numpy.random.Generator for reproducible randomness. If None, creates unseeded generator.
+    
+    Returns:
+        Tuple (pandapower_net, networkx_graph)
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+        print("WARNING: generate_pandapower_net called without RNG - results will not be reproducible!")
+    
     random_net_lv = pp.create_empty_network()
 
-    
-    #random.seed(3333)
+    # Note: Removed hardcoded seed - now using passed RNG parameter
+    # #random.seed(3333)
 
     graph = nx.DiGraph()
 
@@ -405,17 +426,17 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
         graph.add_edge(parent_bus, working_bus)    
         graph[parent_bus][working_bus]['type'] = 'transformer'
         
-        #randomize how many forks this line will be
-        Forks = random.randint(*LineForksRange)
+        #randomize how many forks this line will be (using passed rng)
+        Forks = rng.integers(LineForksRange[0], LineForksRange[1] + 1)  # +1 because high is exclusive
         
-        #randomize how many buses will be in this branch
-        NumBuses = random.randint(*LineBusesRange)
+        #randomize how many buses will be in this branch (using passed rng)
+        NumBuses = rng.integers(LineBusesRange[0], LineBusesRange[1] + 1)  # +1 because high is exclusive
         
         #distribute NumBuses across the forks
         fork_bus_counts = [1] * Forks  # start with 1 bus per fork
         remaining = NumBuses - Forks
         for _ in range(remaining):
-            fork_bus_counts[random.randint(0, Forks - 1)] += 1
+            fork_bus_counts[rng.integers(0, Forks)] += 1  # high is exclusive, so no +1 needed
         
         added_busses = []        
         
@@ -440,7 +461,7 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
 
             #pick a random child bus to connect the next fork
             if f < Forks - 1:
-                working_bus = random.choice(added_busses)
+                working_bus = rng.choice(added_busses)
             else:
                 working_bus = parent_bus    
             
@@ -449,10 +470,10 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
         
         return added_busses
 
-    # Create transformers by type
-    Ct = random.randint(*CommercialRange)
-    It = random.randint(*IndustrialRange)
-    Rt = random.randint(*ResidencialRange)
+    # Create transformers by type (using passed rng)
+    Ct = rng.integers(CommercialRange[0], CommercialRange[1] + 1)  # +1 because high is exclusive
+    It = rng.integers(IndustrialRange[0], IndustrialRange[1] + 1)
+    Rt = rng.integers(ResidencialRange[0], ResidencialRange[1] + 1)
 
     for i in range(Ct):
         new_lines = add_transformer_branch(
@@ -481,7 +502,8 @@ def generate_pandapower_net(CommercialRange, IndustrialRange, ResidencialRange,
 
     success = generate_network_coordinates(        
         root_bus_index=mv_bus,        
-        graph=graph,        
+        graph=graph,
+        rng=rng,  # Pass rng to coordinate generation
         max_attempts=50  # Maximum attempts to place a point
     )   
 
@@ -730,8 +752,9 @@ def get_vertex_coordinate(vertex, graph):
         graph.nodes[vertex]['coordinates'] = polar_to_cartesian(radius, angle)
     return graph.nodes[vertex]['coordinates']
 
-def randomize_position(vertex, graph, max_angle, max_distance):
-    delta_theta = random.gauss(0, max_angle)    
+def randomize_position(vertex, graph, max_angle, max_distance, rng):
+    """Randomize position of a vertex using provided RNG for reproducibility."""
+    delta_theta = rng.normal(0, max_angle)  # Using normal instead of gauss (they're equivalent)    
     
     
         
@@ -753,7 +776,7 @@ def randomize_position(vertex, graph, max_angle, max_distance):
     # 4. Calculate the new distance d_prime from P1 to P2'
     r_prime = 0
     while r_prime < 50:
-        delta_r = random.gauss(0, max_distance)
+        delta_r = rng.normal(0, max_distance)
         r_prime = r + delta_r
 
     # 5. Calculate the Cartesian coordinates of the new point P2_prime
@@ -792,7 +815,8 @@ def build_multilines_from_edges(edges, graph):
     return MultiLineString(lines)
 
 
-def randomize_branch_positions(graph, vertex_to_randomize, max_trials=50):
+def randomize_branch_positions(graph, vertex_to_randomize, rng, max_trials=50):
+    """Randomize branch positions using provided RNG."""
     subtree_nodes = set(nx.descendants(graph, vertex_to_randomize)) | {vertex_to_randomize}
     main_nodes = set(graph.nodes) - subtree_nodes
 
@@ -810,7 +834,7 @@ def randomize_branch_positions(graph, vertex_to_randomize, max_trials=50):
 
     for trial in range(max_trials):
         # New random position
-        new_vertex_pos,dx,dy,dr,dtheta =  randomize_position(vertex_to_randomize, graph, (20.0*math.pi)/180, 200.0)
+        new_vertex_pos,dx,dy,dr,dtheta =  randomize_position(vertex_to_randomize, graph, (20.0*math.pi)/180, 200.0, rng)
 
         # Apply transforms to geometry
         transformed_branch = affinity.rotate(branch_geom, math.degrees(dtheta), origin=parent_pos)
@@ -861,7 +885,16 @@ def randomize_branch_positions(graph, vertex_to_randomize, max_trials=50):
 
 
 
-def generate_network_coordinates(root_bus_index, graph: nx.DiGraph, max_attempts=50):    
+def generate_network_coordinates(root_bus_index, graph: nx.DiGraph, rng, max_attempts=50):
+    """
+    Generate geographic coordinates for network nodes.
+    
+    Args:
+        root_bus_index: Index of root bus
+        graph: NetworkX graph
+        rng: numpy.random.Generator for reproducible randomness
+        max_attempts: Maximum attempts to place nodes
+    """    
     
     success = False    
     
@@ -967,7 +1000,7 @@ def generate_network_coordinates(root_bus_index, graph: nx.DiGraph, max_attempts
             graph.nodes[node].pop(key, None)
         if node == root_bus_index:
             continue  # Skip the root        
-        randomize_branch_positions(graph, node, max_trials=max_attempts)
+        randomize_branch_positions(graph, node, rng, max_trials=max_attempts)
     
     success = True 
     return success, graph 

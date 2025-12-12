@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 from numpy.random import SeedSequence, default_rng
+import hashlib
 load_dotenv()
 
 # Add local-mosaik-pandapower-2.src.mosaik_components to Python path
@@ -30,12 +31,13 @@ postgres_module_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '
 if postgres_module_path not in sys.path:
     sys.path.insert(0, postgres_module_path)
 
-def get_rng_for_component(root_ss: np.random.SeedSequence, key):
+def get_rng_for_component(root_ss: np.random.SeedSequence, key, entity_id):
     """Create a reproducible RNG for a component using a deterministic key."""
-    key_int = abs(hash(key)) % (2**32)
+    h = hashlib.sha256(str(key).encode()).digest()
+    key_int = int.from_bytes(h[:4], 'little')   # 32-bit int     
     child_ss = np.random.SeedSequence(
         entropy=root_ss.entropy,
-        spawn_key=(key_int,)
+        spawn_key=(key_int,entity_id)
     )
     return np.random.default_rng(child_ss)
 
@@ -90,8 +92,8 @@ def run_simulation(params):
     
     
     #deal with the random number generators for each component
-    rng_network_generation = get_rng_for_component(root_seed_sequence, "NetworkGeneration")
-    rng_power_profile = get_rng_for_component(root_seed_sequence, "PowerProfile")  
+    rng_network_generation = get_rng_for_component(root_seed_sequence, "NetworkGeneration", 0)
+    rng_power_profile = get_rng_for_component(root_seed_sequence, "PowerProfile", 0)     
     
     print(f"Initialized simulation with master seed: {master_seed}")
 
@@ -293,20 +295,23 @@ def run_simulation(params):
 
             if 'household_params' in graph.nodes[bus]:
                 #plot solar panel power            
+                hp = graph.nodes[bus]['household_params']
+
                 irradiation_model = irradiation_sim.SolarIrradiation(
                     latitude=graph.nodes[bus]['latlon'][0],
-                    longitude=graph.nodes[bus]['latlon'][1]
-                    )
+                    longitude=graph.nodes[bus]['latlon'][1],
+                    Index=hp['Index']
+                )
                 
-                # Extract only the parameters expected by HouseholdProducer constructor
-                hp = graph.nodes[bus]['household_params']
+                # Extract only the parameters expected by HouseholdProducer constructor                
                 household_constructor_params = {
                     'SolarPeakPower_MW': hp['SolarPeakPower_MW'],
                     'StorageCapacity_MWh': hp['StorageCapacity_MWh'],
                     'InitialSOC_percent': hp['InitialSOC_percent'],
                     'MaxChargePower_MW': hp['MaxChargePower_MW'],
                     'MaxDischargePower_MW': hp['MaxDischargePower_MW'],
-                    'InverterType': hp['InverterType']
+                    'InverterType': hp['InverterType'],
+                    'Index': hp['Index']
                 }
                 house_model = household_sim.HouseholdProducer(**household_constructor_params)
 

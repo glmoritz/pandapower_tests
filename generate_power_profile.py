@@ -91,7 +91,8 @@ def distribute_loads_to_buses(net, graph, params, db, rng=None):
                 "InitialSOC_percent": initial_charge,
                 "MaxChargePower_MW": MaxChargePower_kW/1000,
                 "MaxDischargePower_MW": MaxDischargePower_kW/1000,
-                "InverterType": inverter_type
+                "InverterType": inverter_type,
+                "Index": f'{bus}{i}'
             }
             graph.nodes[bus]['household_params'] = household_params
 

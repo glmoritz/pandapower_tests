@@ -29,7 +29,7 @@ META: Meta = {
     "models": {
         "HouseholdProducer": {
             "public": True,            
-            "params": ['SolarPeakPower_MW', 'StorageCapacity_MWh', 'InitialSOC_percent', 'MaxChargePower_MW', 'MaxDischargePower_MW','InverterType'],
+            "params": ['SolarPeakPower_MW', 'StorageCapacity_MWh', 'InitialSOC_percent', 'MaxChargePower_MW', 'MaxDischargePower_MW','InverterType', 'Index'],
             "trigger": ['Irradiance[W/m2]', 'PowerConsumption[MW]', 'GridExportLimit[MW]', 'GridDemand[MW]', 'PowerFactorDemand'],
             "persistent": ['P_a_load[MW]',
                            'P_b_load[MW]',
@@ -105,7 +105,9 @@ class HouseholdProducerModel(mosaik_api.Simulator):
 
         entities = []
         for i in range(num):
-            eid = f'{self.eid_prefix}_{len(self.entities)+i}'
+            eid = f'{self.eid_prefix}_{params.get("Index", i)}'
+            if eid in self.entities:
+                raise ValueError(f'Entity ID "{eid}" already exists.')  
             self.entities[eid] = {
                 'SOC[MWh]': (params['InitialSOC_percent'][i]/100.0)*params['StorageCapacity_MWh'][i],         
                 'SolarPeakPower_MW': params['SolarPeakPower_MW'][i],
