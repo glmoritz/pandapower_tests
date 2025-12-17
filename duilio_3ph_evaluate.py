@@ -214,20 +214,8 @@ def run_simulation(params):
                                             buff_size=int(params['step_size_s'])
                                         )
 
-    # Save grid version used in this simulation
-    sql = text("""UPDATE building_power.simulation_outputs
-              SET pandapower_grid_id = :grid_id
-              WHERE simulation_output_id = (
-                  SELECT simulation_output_id 
-                  FROM building_power.simulation_outputs 
-                  WHERE parameters->>'network_id' = :network_id
-                  ORDER BY simulation_output_id DESC 
-                  LIMIT 1
-              );
-            """)        
-    with engine.connect() as conn:
-        conn.execute(sql, {"grid_id": pandapower_grid_id, "network_id": params['network_id']})
-        conn.commit()  
+    # Save grid version used in this simulation (using direct access to simulation_id)
+    result_output_model._async_model_factory._proxy.sim.set_pandapower_grid_id(pandapower_grid_id)  
 
     grid = pp_sim.Grid(net=net)
     
@@ -356,12 +344,25 @@ def run_simulation(params):
                             ORDER BY bucket                
                             """
 
-                    power_model = power_consumption_sim.PostgresReader(query=[sql_query])
+                    power_model = power_consumption_sim.PostgresReader(query=[sql_query], Index=[hp['Index']])
                     world.connect(power_model, house_model, ("Power[kW]","PowerConsumption[MW]"), transform=lambda kw_val: kw_val / 1000) # Convert kW to MW
                     world.connect(power_model, result_writer, 'Power[kW]')            
                     
             
-    world.run(until=float(params['simulation_time_s']))
+    try:
+        world.run(until=float(params['simulation_time_s']))
+        converged = True        
+    except Exception as e:
+        print(f"Simulation error: {e}")
+        if "LoadflowNotConverged" in str(type(e).__name__):
+            print("Power flow calculation did not converge")
+            converged = False
+        else:
+            converged = False        
+        raise
+    finally:
+        # Save grid version and simulation status (using direct access to simulation_id)
+        result_output_model._async_model_factory._proxy.sim.set_simulation_finished(converged)
   
 
 

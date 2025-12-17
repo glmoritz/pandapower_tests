@@ -92,7 +92,7 @@ def distribute_loads_to_buses(net, graph, params, db, rng=None):
                 "MaxChargePower_MW": MaxChargePower_kW/1000,
                 "MaxDischargePower_MW": MaxDischargePower_kW/1000,
                 "InverterType": inverter_type,
-                "Index": f'{bus}{i}'
+                "Index": f'bus{bus}'
             }
             graph.nodes[bus]['household_params'] = household_params
 
@@ -211,9 +211,14 @@ def apply_profile_to_graph(engine, grid_id: int, profile_name: str, graph: nx.Gr
         SELECT 
                pandapower_bus_index, 
                node_data
-        FROM building_power.bus_distributed_metadata
+        FROM building_power.bus_power_profile_assignments
         WHERE pandapower_grid_id = :grid_id
-          AND power_profile_id = :profile_name
+          AND power_profile_id = (
+              SELECT power_profile_id 
+              FROM building_power.power_profiles 
+              WHERE power_profile_name = :profile_name
+                AND pandapower_grid_id = :grid_id
+          )
         ORDER BY pandapower_bus_index;
     """)
 
@@ -224,12 +229,16 @@ def apply_profile_to_graph(engine, grid_id: int, profile_name: str, graph: nx.Gr
         
         for row in rows:
             bus_idx = row[0]
-            node_data = row[1]  # This is already a dict from JSONB
+            node_data_json = row[1]  # JSON string from database
             
             if bus_idx not in graph.nodes:
                 continue
             
-            # Restore all node properties from the JSON, decoding custom objects
+            # Parse JSON and restore all node properties, decoding custom objects
+            if isinstance(node_data_json, str):
+                node_data = json.loads(node_data_json)
+            else:
+                node_data = node_data_json
             decoded_data = decode_custom_objects(node_data)
             for key, value in decoded_data.items():
                 graph.nodes[bus_idx][key] = value
@@ -256,10 +265,10 @@ def save_graph_metadata(engine, grid_id: int, profile_name: str, graph: nx.Graph
         # 1. Check if profile exists
         # ---------------------------------------------------------
         check_sql = text("""
-            SELECT 1
-            FROM building_power.bus_distributed_metadata
-            WHERE pandapower_grid_id = :grid_id
-            AND power_profile_id = :profile_name
+            SELECT 1 from            
+            building_power.power_profiles AS pp            
+            WHERE pp.pandapower_grid_id = :grid_id
+            AND pp.power_profile_name = :profile_name
             LIMIT 1;
         """)
 
@@ -276,10 +285,10 @@ def save_graph_metadata(engine, grid_id: int, profile_name: str, graph: nx.Graph
             legacy_name = f"{profile_name}_legacy_{ts}"
 
             rename_sql = text("""
-                UPDATE building_power.bus_distributed_metadata
-                SET power_profile_id = :legacy_name
+                UPDATE building_power.power_profiles
+                SET power_profile_name = :legacy_name
                 WHERE pandapower_grid_id = :grid_id
-                AND power_profile_id = :profile_name;
+                AND power_profile_name = :profile_name;
             """)
 
             conn.execute(rename_sql, {
@@ -291,22 +300,50 @@ def save_graph_metadata(engine, grid_id: int, profile_name: str, graph: nx.Graph
             print(f"[INFO] Profile existed. Renamed old profile to {legacy_name}")
 
         # ---------------------------------------------------------
-        # 3. Collect and insert node data as JSON
+        # 3. Insert power profile and collect node data
         # ---------------------------------------------------------
+        # Insert or get the power profile
+        profile_sql = text("""
+            INSERT INTO building_power.power_profiles (power_profile_name, pandapower_grid_id)
+            VALUES (:profile_name, :grid_id)
+            ON CONFLICT (pandapower_grid_id, power_profile_name) DO NOTHING
+            RETURNING power_profile_id;
+        """)
+
+        profile_result = conn.execute(profile_sql, {
+            "grid_id": grid_id,
+            "profile_name": profile_name
+        }).fetchone()
+        
+        if profile_result:
+            power_profile_id = profile_result[0]
+        else:
+            # If ON CONFLICT DO NOTHING, fetch the existing id
+            get_profile_sql = text("""
+            SELECT power_profile_id 
+            FROM building_power.power_profiles 
+            WHERE pandapower_grid_id = :grid_id
+            AND power_profile_name = :profile_name;
+            """)
+            power_profile_id = conn.execute(get_profile_sql, {
+            "grid_id": grid_id,
+            "profile_name": profile_name
+            }).fetchone()[0]
+
         insert_sql = text("""
-            INSERT INTO building_power.bus_distributed_metadata (
-                pandapower_grid_id,
-                pandapower_bus_index,
-                power_profile_id,
-                node_data,
-                created_at
+            INSERT INTO building_power.bus_power_profile_assignments (
+            pandapower_grid_id,
+            pandapower_bus_index,
+            power_profile_id,
+            node_data
             ) VALUES (
-                :grid_id,
-                :bus_index,
-                :profile_name,
-                CAST(:node_data AS jsonb),
-                NOW()
-            );
+            :grid_id,
+            :bus_index,
+            :power_profile_id,
+            CAST(:node_data AS jsonb)
+            )
+            ON CONFLICT (pandapower_grid_id, pandapower_bus_index, power_profile_id)
+            DO UPDATE SET node_data = CAST(:node_data AS jsonb);
         """)
 
         saved_count = 0
@@ -315,10 +352,10 @@ def save_graph_metadata(engine, grid_id: int, profile_name: str, graph: nx.Graph
             node_data_json = json.dumps(dict(attrs), cls=CustomJSONEncoder)
             
             conn.execute(insert_sql, {
-                "grid_id": grid_id,
-                "bus_index": int(bus_id),
-                "profile_name": profile_name,
-                "node_data": node_data_json
+            "grid_id": grid_id,
+            "bus_index": int(bus_id),
+            "power_profile_id": power_profile_id,
+            "node_data": node_data_json
             })
             saved_count += 1
         

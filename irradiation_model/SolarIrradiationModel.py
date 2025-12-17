@@ -96,7 +96,7 @@ class SolarIrradiationModel(mosaik_api.Simulator):
         
         entities = []
         for i in range(num):
-            eid = f'{self.eid_prefix}_{params.get("Index", i)}'
+            eid = f'{self.eid_prefix}_{params.get("Index")[i]}'
             if eid in self.entities:
                 raise ValueError(f'Entity ID "{eid}" already exists.')
             #this will guarantee independent RNG streams per entity             

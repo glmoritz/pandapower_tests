@@ -49,14 +49,18 @@ def parse_variable_name(var_name):
     element_type = None
     element_index = None
     
-    # Try to extract element info with different patterns
+    # Try to extract element type and index from element_info
     if element_info:
-        # Try pattern like "HouseholdProducer_0" or "Bus-1"
-        element_match = re.search(r'([A-Za-z]+)(?:_|-)?(\d+)?', element_info)
-        if element_match:
-            element_type = element_match.group(1)
-            if element_match.group(2):
-                element_index = int(element_match.group(2))
+        # Pattern: ElementType_index or ElementType-index
+        # Examples: HouseholdProducer_bus10, Bus-1, SolarIrradiation_0, SolarIrradiation_bus3
+        match = re.search(r'([A-Za-z]+)[_-](.+)', element_info)
+        if match:
+            element_type = match.group(1)
+            element_index = match.group(2)
+        else:
+            # Fallback if no separator found
+            element_type = element_info
+            element_index = None
     
     # Extract unit if present
     unit = None
@@ -155,6 +159,38 @@ class PostgresWriterModel(mosaik_api.Simulator):
         self.eid = 'PostgresWriter'
 
         return [{'eid': self.eid, 'type': model}]
+
+    def set_pandapower_grid_id(self, grid_id):
+        """Update the simulation record with the pandapower grid ID."""
+        if not self.write_to_db or not self.db_params or self.simulation_id is None:
+            return
+        
+        db_url = f"postgresql://{self.db_params['user']}:{self.db_params['password']}@{self.db_params['host']}:{self.db_params['port']}/{self.db_params['dbname']}"
+        engine = create_engine(db_url)
+        with engine.connect() as conn:
+            query = text("""UPDATE building_power.simulation_outputs
+                            SET pandapower_grid_id = :grid_id
+                            WHERE simulation_output_id = :sim_id;""")
+            conn.execute(query, {"grid_id": grid_id, "sim_id": self.simulation_id})
+            conn.commit()
+
+    def set_simulation_finished(self, converged):
+        """Update the simulation record with final status."""
+        if not self.write_to_db or not self.db_params or self.simulation_id is None:
+            return
+        
+        db_url = f"postgresql://{self.db_params['user']}:{self.db_params['password']}@{self.db_params['host']}:{self.db_params['port']}/{self.db_params['dbname']}"
+        engine = create_engine(db_url)
+        with engine.connect() as conn:
+            query = text("""UPDATE building_power.simulation_outputs
+                            SET finished_at = NOW(),
+                                converged = :converged
+                            WHERE simulation_output_id = :sim_id;""")
+            conn.execute(query, {            
+                "sim_id": self.simulation_id,
+                "converged": converged
+            })
+            conn.commit()
 
     def _register_variables(self, var_names):
         """Ensure variables exist in DB and return their IDs in batch."""

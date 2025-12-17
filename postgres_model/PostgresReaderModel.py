@@ -160,7 +160,7 @@ class PostgresReaderModel(mosaik_api.Simulator):
 
         self.meta['models'][self.model_name] = {
             'public': True,
-            'params': ['query'],
+            'params': ['query', 'Index'],
             'attrs': self.attrs,
         } 
         # Create SQLAlchemy engine
@@ -189,7 +189,10 @@ class PostgresReaderModel(mosaik_api.Simulator):
             rows = result.fetchall()
             columns = result.keys()
             # Create DataFrame
-            eid = f'{self.eid_prefix}_{len(self.entities)+i}'
+            if params.get('Index'):
+                eid = f'{self.eid_prefix}_{params['Index'][i]}' 
+            else:
+                eid = f'{self.eid_prefix}_{len(self.entities)+i}'
             df = pd.DataFrame(rows, columns=columns)
             df.set_index('bucket', inplace=True)  # Optional: make time index
             self.entities[eid] = {
