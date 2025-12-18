@@ -191,6 +191,10 @@ class HouseholdProducerModel(mosaik_api.Simulator):
 
             last_charge_power_mw = entity.get('last_charge_power_mw', 0.0)                                 
             soc_mwh += (last_charge_power_mw) * step_hours * (entity['charge_efficiency'] if last_charge_power_mw > 0.0 else 1.0/entity['discharge_efficiency'])  # charging efficiency
+            if soc_mwh > cap_mwh:
+                soc_mwh = cap_mwh
+            if soc_mwh < 0.0:
+                soc_mwh = 0.0
             soc_percent = 100.0 * soc_mwh / cap_mwh if cap_mwh > 0 else 0.0            
             minimum_battery_operation_time = 10.0
 

@@ -325,7 +325,7 @@ def run_simulation(params):
                     for k, bus_phase in enumerate(graph.nodes[bus]['inverter_connection_phases']):
                         world.connect(house_model,graph.nodes[bus]['bus_element'], (f'Q_{inverter_phases[k]}_load[MVar]',f'Q_{bus_phase}_load[MVar]'))
                         world.connect(house_model,graph.nodes[bus]['bus_element'], (f'P_{inverter_phases[k]}_load[MW]',f'P_{bus_phase}_load[MW]'))
-                        world.connect(house_model, result_writer, f'P_{bus_phase}_load[MW]')            
+                        world.connect(house_model, result_writer, f'P_{inverter_phases[k]}_load[MW]')            
 
                 if 'connected_buildings_ids' in graph.nodes[bus]: 
                     bldg_ids = ', '.join([str(i) for i in graph.nodes[bus]['connected_buildings_ids']])

@@ -158,9 +158,70 @@ def explain_get_timeseries_data(
 
 
 
-
-
 def get_timeseries_data(conn, simulation_id, element_type=None, element_idxs=None, output_name=None):
+        # Build dynamic WHERE clauses
+        where_clauses = ["v.simulation_output_id = :simulation_id"]
+        params = {"simulation_id": simulation_id}
+
+        if element_type is not None:
+                where_clauses.append("v.extra_info ->> 'element_type' LIKE :element_type")
+                params["element_type"] = element_type
+
+        if element_idxs is not None:
+                # Ensure element_idxs is a list for ANY clause
+                if isinstance(element_idxs, int):
+                        element_idxs = [element_idxs]
+                where_clauses.append("(v.extra_info ->> 'element_index')::int = ANY(:element_idxs)")
+                params["element_idxs"] = element_idxs
+
+        if output_name is not None:
+                where_clauses.append("v.extra_info ->> 'output' LIKE :output_name")
+                params["output_name"] = output_name
+
+        where_sql = " AND ".join(where_clauses)
+
+        # LOCF = last observation carried forward
+        query = text(f"""
+                WITH bus_variables AS (
+                SELECT v.variable_id, v.variable_name, v.extra_info
+                FROM building_power.variable v
+                WHERE {where_sql}
+                ),
+                per_variable AS (
+                SELECT
+                        time_bucket('15 minutes', ot.ts) AS bucket,
+                        ot.variable_id,
+                COALESCE(
+                        average(time_weight('locf', ot.ts, ot.quantity)),
+                (
+                        SELECT quantity
+                        FROM building_power.output_timeseries
+                        WHERE variable_id = ot.variable_id
+                        ORDER BY ts
+                        LIMIT 1
+                )
+        ) AS avg_quantity
+                FROM building_power.output_timeseries ot
+                JOIN bus_variables bv ON ot.variable_id = bv.variable_id
+                GROUP BY bucket, ot.variable_id
+                )
+                SELECT
+                bucket,
+                SUM(avg_quantity) AS total_quantity
+                FROM per_variable
+                GROUP BY bucket
+                ORDER BY bucket;""")
+        
+        df = pd.read_sql_query(
+                query,
+                conn,
+                params=params
+        )
+        return df
+
+
+
+def get_timeseries_data_new(conn, simulation_id, element_type=None, element_idxs=None, output_name=None):
         """
         Retrieves aggregated timeseries data using the optimized Continuous Aggregate.
         Note: Returns SUM(power) as total_power, not SUM(AVG(power)).
