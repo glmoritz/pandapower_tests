@@ -3,6 +3,7 @@ import pvlib
 import numpy as np
 from datetime import datetime, timedelta
 import math
+from numbers import Number
 
 import mosaik_api_v3 as mosaik_api
 from typing_extensions import override
@@ -314,9 +315,9 @@ class HouseholdProducerModel(mosaik_api.Simulator):
 
             for phase in ['a', 'b', 'c']:
                 if step_results[f'P_{phase}_load[MW]'] < 0:
-                    grid_imported_mwh += ((-1)*step_results[f'P_{phase}_load[MW]'] if phase in phases else 0.0) * step_hours
+                    grid_exported_mwh += ((-1)*step_results[f'P_{phase}_load[MW]'] if phase in phases else 0.0) * step_hours
                 else:
-                    grid_exported_mwh += (step_results[f'P_{phase}_load[MW]'] if phase in phases else 0.0) * step_hours
+                    grid_imported_mwh += (step_results[f'P_{phase}_load[MW]'] if phase in phases else 0.0) * step_hours
                     
 
             #update the energy values with the current step values (trapezoidal integration)
@@ -371,10 +372,13 @@ class HouseholdProducerModel(mosaik_api.Simulator):
                 raise ValueError('Unknown entity ID "%s"' % eid)
             data[eid] = {}
             for attr in attrs:
-                if isinstance(self.results[eid][attr], np.floating) or isinstance(self.results[eid][attr], np.integer):
-                    data[eid][attr] = self.results[eid][attr].tolist()
+                value = self.results[eid][attr]
+                if isinstance(value, np.floating) or isinstance(value, np.integer):
+                    data[eid][attr] = value.item()
+                elif isinstance(value, Number):
+                    data[eid][attr] = value
                 else:
-                    data[eid][attr] = str(self.results[eid][attr])  
+                    data[eid][attr] = value
 
         return data
 

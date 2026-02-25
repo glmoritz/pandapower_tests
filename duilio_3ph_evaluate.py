@@ -12,6 +12,7 @@ from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 from numpy.random import SeedSequence, default_rng
 import hashlib
+import traceback as tb
 load_dotenv()
 
 # Add local-mosaik-pandapower-2.src.mosaik_components to Python path
@@ -43,6 +44,26 @@ def get_rng_for_component(root_ss: np.random.SeedSequence, key, entity_id):
 
 
 def run_simulation(params):
+    """Run the full mosaik simulation.
+
+    Returns:
+        dict with keys: name, base_name, status, converged, started_at,
+        finished_at, duration_s, and on failure: error, error_type, traceback.
+    """
+    start_time_wall = time.time()
+    converged = False
+    result_output_model = None
+    result = {
+        'name': params.get('name', ''),
+        'base_name': params.get('base_name', ''),
+        'started_at': datetime.now().isoformat(),
+        'random_seed': params.get('random_seed'),
+        'network_id': params.get('network_id'),
+        'power_profile_id': params.get('power_profile_id'),
+        'solar_power_range': params.get('solar_power_range_per_branch_kW'),
+        'storage_capacity_range': params.get('storage_capacity_range_per_branch_kWh'),
+    }
+
     # Simulator backends
     SIM_CONFIG = {
         'ChargerSim': {        
@@ -67,9 +88,12 @@ def run_simulation(params):
             'python': 'postgres_model.PostgresReaderModel:PostgresReaderModel'
         },
         'PostgresWriterModel': {
-            'python': 'postgres_model.PostgresWriterModel:PostgresWriterModel'
+            'python': 'postgres_model.PostgresWriterModelSimplified:PostgresWriterModelSimplified'
         }
     }    
+
+    network_id = f"{params['network_id']}_seed_{str(params['random_seed'])}"
+    power_profile_id = f"{params['power_profile_id']}_seed_{str(params['random_seed'])}"
 
     #start mosaik simulation world
     world = mosaik.World(SIM_CONFIG)   
@@ -101,10 +125,10 @@ def run_simulation(params):
     net, graph = None, None
     if params['use_saved_network_if_exists']:
         try:
-            pandapower_grid_id, net, graph = load_network_from_database(db, params['network_id'])
-            print(f"Loaded existing network '{params['network_id']}' from database.")
+            pandapower_grid_id, net, graph = load_network_from_database(db, network_id)
+            print(f"Loaded existing network '{network_id}' from database.")
         except Exception as e:
-            print(f"Network '{params['network_id']} does not exist': {e}")
+            print(f"Network '{network_id} does not exist': {e}")
             pandapower_grid_id, net, graph = None, None, None
     
     if net is None or graph is None:
@@ -135,28 +159,28 @@ def run_simulation(params):
             graph = graph,
             net= net,
             db_connection = db,
-            grid_name = params['network_id'])             
-        print(f"Saved new network '{params['network_id']}' to database.")
+            grid_name = network_id)             
+        print(f"Saved new network '{network_id}' to database.")
 
     profile_loaded = False
     if params['use_saved_power_profile_if_exists']:
         profile_loaded = apply_profile_to_graph(
             engine,
             pandapower_grid_id,
-            params['power_profile_id'],
+            power_profile_id,
             graph
         )        
         if profile_loaded:
-            print(f"Loaded existing power profile '{params['power_profile_id']}' from database.")
+            print(f"Loaded existing power profile '{power_profile_id}' from database.")
         else:
-            print(f"Power profile '{params['power_profile_id']}' does not exist.")
+            print(f"Power profile '{power_profile_id}' does not exist.")
             
     
     if not profile_loaded:
-        print(f"Generating Power profile '{params['power_profile_id']}'.")
+        print(f"Generating Power profile '{power_profile_id}'.")
         distribute_loads_to_buses(net, graph, params, db, rng=rng_power_profile)  # Pass independent RNG for power profile
-        save_graph_metadata(engine, pandapower_grid_id, params['power_profile_id'], graph)
-        print(f"Saved power profile '{params['power_profile_id']}' to database.")
+        save_graph_metadata(engine, pandapower_grid_id, power_profile_id, graph)
+        print(f"Saved power profile '{power_profile_id}' to database.")
     
     # Create PV system with certain configuration
     pv_sim = world.start(
@@ -206,9 +230,13 @@ def run_simulation(params):
                                             db_connection=db,                                                                                                                                    
                                             write_to_db=True,
                                             simulation_params=params,
-                                            output_csv=True,
-                                            output_file=f'{params['results_dir']}/{params['output_file']}',
-                                            time_resolution=1)                                              
+                                            output_csv=False,
+                                            output_file=os.path.join(
+                                                params.get('results_dir', '.'),
+                                                params.get('output_file', f"{params.get('base_name', 'output')}.csv")
+                                            ),
+                                            time_resolution=1,
+                                            bucket_size_s=int(params.get('bucket_size_s', 900)))  # 15 min default                                              
     
     result_writer = result_output_model.PostgresWriterModel(
                                             buff_size=int(params['step_size_s'])
@@ -351,30 +379,50 @@ def run_simulation(params):
             
     try:
         world.run(until=float(params['simulation_time_s']))
-        converged = True        
+        converged = True
+        result['status'] = 'success'
+        result['converged'] = True
     except Exception as e:
         print(f"Simulation error: {e}")
-        if "LoadflowNotConverged" in str(type(e).__name__):
-            print("Power flow calculation did not converge")
-            converged = False
+        converged = False
+        result['converged'] = False
+        if "LoadflowNotConverged" in type(e).__name__:
+            result['status'] = 'convergence_error'
         else:
-            converged = False        
-        raise
+            result['status'] = 'error'
+        result['error'] = str(e)
+        result['error_type'] = type(e).__name__
+        result['traceback'] = tb.format_exc()
     finally:
-        # Save grid version and simulation status (using direct access to simulation_id)
-        result_output_model._async_model_factory._proxy.sim.set_simulation_finished(converged)
-  
+        if result_output_model is not None:
+            try:
+                result_output_model._async_model_factory._proxy.sim.set_simulation_finished(converged)
+            except Exception:
+                pass
+        result['finished_at'] = datetime.now().isoformat()
+        result['duration_s'] = round(time.time() - start_time_wall, 2)
+
+    return result
 
 
 if __name__ == "__main__":
-    # Load parameters from JSON file
     params = None
     while params is None:
         params = find_and_lock_param_file()
-
         if params is None:
+            print("[INFO] No param files found, waiting...")
             time.sleep(10)
-        else:
-            # Run the simulation with the loaded parameters
-            run_simulation(params)
+
+    result = run_simulation(params)
+
+    # Write result JSON
+    result_file = params.get('result_file')
+    if result_file:
+        os.makedirs(os.path.dirname(result_file), exist_ok=True)
+        with open(result_file, 'w') as f:
+            import json
+            json.dump(result, f, indent=2)
+
+    status = result.get('status', 'unknown')
+    print(f"[INFO] Simulation finished: {params.get('base_name')} -> {status} ({result.get('duration_s', '?')}s)")
 
