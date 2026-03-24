@@ -9,6 +9,10 @@ ENV PYTHONUNBUFFERED=1
 
 RUN adduser -u 5678 --disabled-password --gecos "" appuser
 
+# Create group and user matching NFS mount owner (UID 1001 / GID 1000)
+RUN groupadd -g 1000 nfsgroup && \
+    useradd -u 1001 -g 1000 -m -s /bin/bash moritz
+
 RUN apt update
 
 RUN apt install -y build-essential git gfortran cmake libopenblas-dev
@@ -39,10 +43,9 @@ WORKDIR /pandapower/app
 #RUN python -m grpc_tools.protoc -I ../apis --pyi_out=./sigivest_apis --python_out=./sigivest_apis --grpc_python_out=./sigivest_apis $(find ../apis -iname "*.proto") 
 #RUN mv sigivest_apis/google .
 
-# Creates a non-root user with an explicit UID and adds permission to access the /sigivest folder
-# For more info, please refer to https://aka.ms/vscode-docker-python-configure-containers
-RUN chown -R appuser /pandapower
-#USER appuser
+# Give moritz ownership of the app directory and switch to it
+RUN chown -R moritz:nfsgroup /pandapower
+USER moritz
 
 #EXPOSE 50001
 WORKDIR /pandapower
