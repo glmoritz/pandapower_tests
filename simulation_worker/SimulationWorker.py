@@ -15,6 +15,7 @@ Usage:
 import os
 import json
 import time
+import random
 import traceback
 import argparse
 from datetime import datetime
@@ -35,11 +36,15 @@ def find_and_lock_param_file():
     RUNNING_DIR = os.getenv('RUNNING_DIR')
     RESULTS_DIR = os.getenv('RESULTS_DIR')
     FINISHED_DIR = os.getenv('FINISHED_DIR')
+    FINISHED_SUCCESS_DIR = os.path.join(FINISHED_DIR, '01_success')
+    FINISHED_EXCEPTION_DIR = os.path.join(FINISHED_DIR, '02_exception')
 
     # Create dirs if they don't exist yet
     os.makedirs(RUNNING_DIR, exist_ok=True)
     os.makedirs(RESULTS_DIR, exist_ok=True)
     os.makedirs(FINISHED_DIR, exist_ok=True)
+    os.makedirs(FINISHED_SUCCESS_DIR, exist_ok=True)
+    os.makedirs(FINISHED_EXCEPTION_DIR, exist_ok=True)
 
     for filename in sorted(os.listdir(PARAMS_DIR)):
         if not filename.endswith('.json'):
@@ -59,7 +64,8 @@ def find_and_lock_param_file():
             params['param_file'] = dst
             params['result_file'] = os.path.join(RESULTS_DIR, filename)
             params['results_dir'] = RESULTS_DIR
-            params['finished_dir'] = FINISHED_DIR
+            params['finished_success_dir'] = FINISHED_SUCCESS_DIR
+            params['finished_exception_dir'] = FINISHED_EXCEPTION_DIR
             # Use base_name as output_file to avoid collisions in parallel runs
             params['output_file'] = f"{base_name}.csv"
 
@@ -82,6 +88,27 @@ def worker(worker_id):
         base_name = params['base_name']
         print(f"[Worker-{worker_id}] Starting: {base_name}")
 
+        delay_base_s = max(float(params.get(
+            'simulation_start_delay_s',
+            os.getenv('SIMULATION_START_DELAY_S', '0.5')
+        )), 0.0)
+        delay_jitter_s = max(float(params.get(
+            'simulation_start_delay_jitter_s',
+            os.getenv('SIMULATION_START_DELAY_JITTER_S', '0.5')
+        )), 0.0)
+        worker_skew_s = max(float(params.get(
+            'simulation_start_worker_skew_s',
+            os.getenv('SIMULATION_START_WORKER_SKEW_S', '0.15')
+        )), 0.0)
+
+        start_delay_s = delay_base_s + (worker_id * worker_skew_s)
+        if delay_jitter_s > 0:
+            start_delay_s += random.uniform(0.0, delay_jitter_s)
+
+        if start_delay_s > 0:
+            print(f"[Worker-{worker_id}] Delaying start by {start_delay_s:.3f}s: {base_name}")
+            time.sleep(start_delay_s)
+
         try:
             result = run_simulation(params)
         except Exception as e:
@@ -100,12 +127,21 @@ def worker(worker_id):
         with open(params['result_file'], 'w') as f:
             json.dump(result, f, indent=2)
 
-        # Move param file to finished dir
+        # Move param file to success/exception finished dir
         try:
-            finished_path = os.path.join(
-                params.get('finished_dir', os.getenv('FINISHED_DIR', '')),
-                os.path.basename(params['param_file'])
-            )
+            success_dir = params.get('finished_success_dir')
+            exception_dir = params.get('finished_exception_dir')
+
+            if not success_dir or not exception_dir:
+                base_finished_dir = os.getenv('FINISHED_DIR', '')
+                success_dir = os.path.join(base_finished_dir, '01_success')
+                exception_dir = os.path.join(base_finished_dir, '02_exception')
+
+            os.makedirs(success_dir, exist_ok=True)
+            os.makedirs(exception_dir, exist_ok=True)
+
+            target_dir = success_dir if result.get('status') == 'success' else exception_dir
+            finished_path = os.path.join(target_dir, os.path.basename(params['param_file']))
             os.rename(params['param_file'], finished_path)
         except OSError:
             pass

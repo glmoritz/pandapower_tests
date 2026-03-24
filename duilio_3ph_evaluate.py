@@ -6,6 +6,8 @@ import networkx as nx
 from simulation_worker.SimulationWorker import find_and_lock_param_file
 from create_random_network import generate_pandapower_net, load_network_from_database, save_network_to_database
 from generate_power_profile import distribute_loads_to_buses, apply_profile_to_graph, save_graph_metadata
+from convergence_debugger import analyze_convergence, analyze_convergence_from_pickle
+import glob
 import time
 from datetime import datetime, timedelta
 from sqlalchemy import create_engine, text
@@ -121,17 +123,36 @@ def run_simulation(params):
     
     print(f"Initialized simulation with master seed: {master_seed}")
 
+    # Asset loading behavior control:
+    # - require_existing_assets: If True, fail if network/profile doesn't exist (no auto-generation)
+    # - use_saved_network_if_exists / use_saved_power_profile_if_exists: Legacy flags (deprecated)
+    #   When require_existing_assets is True, these flags are ignored.
+    require_existing_assets = params.get('require_existing_assets', False)
+    
     #Load the simulation network from database or create a new one
     net, graph = None, None
-    if params['use_saved_network_if_exists']:
-        try:
-            pandapower_grid_id, net, graph = load_network_from_database(db, network_id)
-            print(f"Loaded existing network '{network_id}' from database.")
-        except Exception as e:
-            print(f"Network '{network_id} does not exist': {e}")
-            pandapower_grid_id, net, graph = None, None, None
+    pandapower_grid_id = None
     
+    # Always try to load from database first
+    try:
+        pandapower_grid_id, net, graph = load_network_from_database(db, network_id)
+        print(f"Loaded existing network '{network_id}' from database.")
+    except Exception as e:
+        print(f"Network '{network_id}' does not exist in database: {e}")
+        pandapower_grid_id, net, graph = None, None, None
+    
+    # If network not found, check if we should generate or fail
     if net is None or graph is None:
+        if require_existing_assets:
+            raise ValueError(
+                f"Network '{network_id}' not found in database and require_existing_assets=True. "
+                f"Run 'python -m simulation_worker.RegenerateAssets --network' to generate networks first."
+            )
+        
+        # Legacy behavior: check use_saved_network_if_exists flag
+        # If True, network should have been loaded above (but wasn't found), so generate
+        # If False, always generate (explicit regeneration request)
+        print(f"Generating new network '{network_id}'...")
         net, graph = generate_pandapower_net(
             CommercialRange=params['commercial_range'],
             IndustrialRange=params['industrial_range'],
@@ -162,22 +183,27 @@ def run_simulation(params):
             grid_name = network_id)             
         print(f"Saved new network '{network_id}' to database.")
 
+    # Load or generate power profile
     profile_loaded = False
-    if params['use_saved_power_profile_if_exists']:
-        profile_loaded = apply_profile_to_graph(
-            engine,
-            pandapower_grid_id,
-            power_profile_id,
-            graph
-        )        
-        if profile_loaded:
-            print(f"Loaded existing power profile '{power_profile_id}' from database.")
-        else:
-            print(f"Power profile '{power_profile_id}' does not exist.")
+    profile_loaded = apply_profile_to_graph(
+        engine,
+        pandapower_grid_id,
+        power_profile_id,
+        graph
+    )        
+    if profile_loaded:
+        print(f"Loaded existing power profile '{power_profile_id}' from database.")
+    else:
+        print(f"Power profile '{power_profile_id}' does not exist in database.")
             
-    
     if not profile_loaded:
-        print(f"Generating Power profile '{power_profile_id}'.")
+        if require_existing_assets:
+            raise ValueError(
+                f"Power profile '{power_profile_id}' not found in database and require_existing_assets=True. "
+                f"Run 'python -m simulation_worker.RegenerateAssets --profile' to generate profiles first."
+            )
+        
+        print(f"Generating Power profile '{power_profile_id}'...")
         distribute_loads_to_buses(net, graph, params, db, rng=rng_power_profile)  # Pass independent RNG for power profile
         save_graph_metadata(engine, pandapower_grid_id, power_profile_id, graph)
         print(f"Saved power profile '{power_profile_id}' to database.")
@@ -206,10 +232,17 @@ def run_simulation(params):
                                  type="hybrid"
                                 )    
 
-    #Instantiate the power network    
+    #Instantiate the power network
+    # Set up debug pickle directory for convergence failure diagnosis
+    debug_pickle_dir = os.path.join(
+        params.get('results_dir', '.'),
+        'debug_pickles',
+        params.get('base_name', 'unknown')
+    )
     pp_sim = world.start("Pandapower",
                          step_size=int(params['step_size_s']), 
-                         asymmetric_flow=True
+                         asymmetric_flow=True,
+                         debug_pickle_dir=debug_pickle_dir
                         )
  
     #Power Consumption Model    
@@ -236,7 +269,9 @@ def run_simulation(params):
                                                 params.get('output_file', f"{params.get('base_name', 'output')}.csv")
                                             ),
                                             time_resolution=1,
-                                            bucket_size_s=int(params.get('bucket_size_s', 900)))  # 15 min default                                              
+                                            bucket_size_s=int(params.get('bucket_size_s', 900)),
+                                            enable_balance_breakpoint=bool(params.get('enable_balance_breakpoint', False)),
+                                            balance_tolerance_mw=float(params.get('balance_tolerance_mw', 1e-6)))  # 15 min default                                              
     
     result_writer = result_output_model.PostgresWriterModel(
                                             buff_size=int(params['step_size_s'])
@@ -327,6 +362,8 @@ def run_simulation(params):
                     'MaxChargePower_MW': hp['MaxChargePower_MW'],
                     'MaxDischargePower_MW': hp['MaxDischargePower_MW'],
                     'InverterType': hp['InverterType'],
+                    'InstallationType': hp.get('InstallationType', '3ph'),
+                    'BreakerLimit_MW': hp.get('BreakerLimit_MW', float('inf')),
                     'Index': hp['Index']
                 }
                 house_model = household_sim.HouseholdProducer(**household_constructor_params)
@@ -349,12 +386,15 @@ def run_simulation(params):
                 #connect the household inverter to the bus (in random phases)
                 inverter_phases = ['a', 'b', 'c']
 
-                if 'inverter_connection_phases' in graph.nodes[bus]:                
-                    for k, bus_phase in enumerate(graph.nodes[bus]['inverter_connection_phases']):
+
+                if 'installation_connection_phases' in graph.nodes[bus]:                
+                    for k, bus_phase in enumerate(graph.nodes[bus]['installation_connection_phases']):
                         world.connect(house_model,graph.nodes[bus]['bus_element'], (f'Q_{inverter_phases[k]}_load[MVar]',f'Q_{bus_phase}_load[MVar]'))
                         world.connect(house_model,graph.nodes[bus]['bus_element'], (f'P_{inverter_phases[k]}_load[MW]',f'P_{bus_phase}_load[MW]'))
-                        world.connect(house_model, result_writer, f'P_{inverter_phases[k]}_load[MW]')            
-
+                        world.connect(house_model, result_writer, f'P_{inverter_phases[k]}_load[MW]')
+                        world.connect(house_model, result_writer, f'Surplus_{inverter_phases[k]}[MW]')            
+                        world.connect(house_model, result_writer, f'BreakerOverload_{inverter_phases[k]}[MW]')            
+                        
                 if 'connected_buildings_ids' in graph.nodes[bus]: 
                     bldg_ids = ', '.join([str(i) for i in graph.nodes[bus]['connected_buildings_ids']])
 
@@ -393,6 +433,29 @@ def run_simulation(params):
         result['error'] = str(e)
         result['error_type'] = type(e).__name__
         result['traceback'] = tb.format_exc()
+
+        # --- Convergence debug: analyze the pickled network snapshot ---
+        try:
+            pickle_files = sorted(glob.glob(os.path.join(debug_pickle_dir, 'debug_net_*.p')))
+            if pickle_files:
+                # Use the last pickle (the failing timestep)
+                last_pickle = pickle_files[-1]
+                print(f"[DEBUG] Running convergence analysis on {last_pickle}")
+                convergence_report = analyze_convergence_from_pickle(last_pickle)
+                result['convergence_debug'] = convergence_report
+                result['convergence_debug_summary'] = convergence_report.get('summary', '')
+                result['convergence_debug_pickle'] = last_pickle
+                result['convergence_debug_total_issues'] = convergence_report.get('total_issues', 0)
+                print(f"[DEBUG] Convergence analysis complete: {convergence_report.get('total_issues', 0)} issues found")
+                print(f"[DEBUG] Summary:\n{convergence_report.get('summary', '')}")
+            else:
+                result['convergence_debug'] = None
+                result['convergence_debug_summary'] = 'No debug pickle found - network state not captured'
+                print(f"[DEBUG] No debug pickle files found in {debug_pickle_dir}")
+        except Exception as debug_err:
+            result['convergence_debug'] = None
+            result['convergence_debug_summary'] = f'Debug analysis failed: {debug_err}'
+            print(f"[DEBUG] Convergence analysis failed: {debug_err}")
     finally:
         if result_output_model is not None:
             try:

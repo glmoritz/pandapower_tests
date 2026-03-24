@@ -97,6 +97,14 @@ storage_distribution = np.random.uniform(size=len(load_buses))
 - **Controllability**: ❌ No - uses global NumPy random state
 - **Distribution**: Uniform [0, 1)
 
+#### Phase Balancing Postprocessing (balance_phase_loading)
+
+When the parameter `balance_phase_loading` is `true` in the scenario JSON, a deterministic postprocessing step runs after all random assignments are complete. This step uses a **greedy algorithm** (no randomness) to reassign connection phases of 1ph and 2ph consumers to minimise phase imbalance per transformer.
+
+- **Controllability**: ✅ Deterministic — no RNG calls; same input always produces same output.
+- **Impact**: Modifies `installation_connection_phases` and `inverter_connection_phases` for 1ph/2ph consumers.
+- **Note**: This runs *after* all random draws, so enabling/disabling it does **not** affect the RNG sequence for other components.
+
 #### Line 58: Initial State of Charge
 ```python
 initial_charge = random.uniform(params['initial_capacity_range'][0], 

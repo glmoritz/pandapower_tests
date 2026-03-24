@@ -18,6 +18,8 @@ import json
 import threading
 import queue
 import re
+import os
+import math
 from datetime import datetime
 from io import StringIO
 
@@ -129,6 +131,11 @@ class PostgresWriterModelSimplified(mosaik_api.Simulator):
         # CSV tracking
         self.csv_first_flush = True
 
+        # Optional debug instrumentation for household power-balance identity
+        self.enable_balance_breakpoint = False
+        self.balance_tolerance_mw = 1e-6
+        self._balance_vars_by_time = {}
+
     def init(self, sid, time_resolution, start_date,
              date_format='%Y-%m-%d %H:%M:%S',
              output_file='results.csv',
@@ -137,7 +144,9 @@ class PostgresWriterModelSimplified(mosaik_api.Simulator):
              write_to_db=False,
              simulation_params=None,
              output_csv=True,
-             bucket_size_s=900):  # New parameter
+               bucket_size_s=900,
+               enable_balance_breakpoint=False,
+               balance_tolerance_mw=1e-6):  # New parameter
 
         self.time_resolution = time_resolution
         self.date_format = date_format
@@ -147,6 +156,10 @@ class PostgresWriterModelSimplified(mosaik_api.Simulator):
         self.write_to_db = write_to_db
         self.output_csv = output_csv
         self.bucket_size_s = bucket_size_s
+
+        env_flag = os.getenv('HOUSEHOLD_BALANCE_BREAKPOINT', '')
+        self.enable_balance_breakpoint = bool(enable_balance_breakpoint) or env_flag.lower() in ('1', 'true', 'yes', 'on')
+        self.balance_tolerance_mw = float(balance_tolerance_mw)
         
         # Initialize bucket aggregator
         self.bucket_aggregator = BucketAggregator(
@@ -162,7 +175,7 @@ class PostgresWriterModelSimplified(mosaik_api.Simulator):
             self.conn = self.engine.connect()
 
             # Ensure simulation_data table exists
-            self._ensure_tables_exist()
+            #self._ensure_tables_exist()
 
             # Insert simulation metadata
             sim_params_json = json.dumps(simulation_params) if simulation_params else '{}'
@@ -186,6 +199,147 @@ class PostgresWriterModelSimplified(mosaik_api.Simulator):
         self.flush_thread.start()
 
         return self.meta
+
+    def _is_household(self, element_type: str) -> bool:
+        return (element_type or '').lower() == 'householdproducer'
+
+    def _required_balance_vars_present(self, values_by_var):
+        required = (
+            'PVPowerGeneration[MW]',
+            'BatteryPower[MW]',
+            'Power[kW]'
+        )
+        return all(var in values_by_var for var in required)
+
+    def _trigger_balance_breakpoint(self, *, check_scope, entity_key, time_s, values_by_var, balance_mw):
+        if not self.enable_balance_breakpoint:
+            return
+
+        debug_payload = {
+            'scope': check_scope,
+            'entity': entity_key,
+            'time_s': time_s,
+            'balance_mw': balance_mw,
+            'tolerance_mw': self.balance_tolerance_mw,
+            'P_a_load[MW]': values_by_var.get('P_a_load[MW]'),
+            'P_b_load[MW]': values_by_var.get('P_b_load[MW]'),
+            'P_c_load[MW]': values_by_var.get('P_c_load[MW]'),
+            'Power[kW]': values_by_var.get('Power[kW]'),
+            'BreakerOverload[MW]': values_by_var.get('BreakerOverload[MW]'),
+            'BreakerOverload_a[MW]': values_by_var.get('BreakerOverload_a[MW]'),
+            'BreakerOverload_b[MW]': values_by_var.get('BreakerOverload_b[MW]'),
+            'BreakerOverload_c[MW]': values_by_var.get('BreakerOverload_c[MW]'),
+            'PVPowerGeneration[MW]': values_by_var.get('PVPowerGeneration[MW]'),
+            'BatteryPower[MW]': values_by_var.get('BatteryPower[MW]'),
+        }
+        print(
+            "[BALANCE-ERROR] Household identity violation "
+            f"scope={check_scope} entity={entity_key} t={time_s}s "
+            f"balance={balance_mw:.12f} MW tol={self.balance_tolerance_mw} MW"
+        )
+        print(f"[BALANCE-ERROR] payload={debug_payload}")
+        breakpoint()
+
+    def _compute_balance_mw(self, values_by_var):
+        p_sum = (
+            float(values_by_var.get('P_a_load[MW]', 0.0))
+            + float(values_by_var.get('P_b_load[MW]', 0.0))
+            + float(values_by_var.get('P_c_load[MW]', 0.0))
+        )
+        overload_total = float(values_by_var.get('BreakerOverload[MW]', 0.0))
+        if overload_total == 0.0:
+            overload_total = (
+                float(values_by_var.get('BreakerOverload_a[MW]', 0.0))
+                + float(values_by_var.get('BreakerOverload_b[MW]', 0.0))
+                + float(values_by_var.get('BreakerOverload_c[MW]', 0.0))
+            )
+
+        pv = float(values_by_var.get('PVPowerGeneration[MW]', 0.0))
+        battery = float(values_by_var.get('BatteryPower[MW]', 0.0))
+        power_consumption = float(values_by_var.get('Power[kW]', 0.0))/-1000.0
+
+        # Invariant requested by user instrumentation:
+        # P_a + P_b + P_c + BreakerOverload + PV - Battery + PowerConsumption == 0
+        return p_sum + overload_total + pv - battery + power_consumption
+
+    def _check_balance_identity(self, *, check_scope, entity_key, time_s, values_by_var):
+        if not self._required_balance_vars_present(values_by_var):
+            return
+
+        balance_mw = self._compute_balance_mw(values_by_var)
+        if not math.isfinite(balance_mw):
+            self._trigger_balance_breakpoint(
+                check_scope=check_scope,
+                entity_key=entity_key,
+                time_s=time_s,
+                values_by_var=values_by_var,
+                balance_mw=balance_mw,
+            )
+            return
+
+        if abs(balance_mw) > self.balance_tolerance_mw:
+            self._trigger_balance_breakpoint(
+                check_scope=check_scope,
+                entity_key=entity_key,
+                time_s=time_s,
+                values_by_var=values_by_var,
+                balance_mw=balance_mw,
+            )
+
+    def _check_step_balance(self, time_s, inputs):
+        per_entity = {}
+        for attr, values in inputs.get(self.eid, {}).items():
+            for src, value in values.items():
+                var_info = parse_variable_name(f'{src}-{attr}')
+                element_type = var_info['element_type'] or 'unknown'
+                # if not self._is_household(element_type):
+                #     continue
+                entity_key = var_info['element_index'] or ''
+                entity_values = per_entity.setdefault(entity_key, {})
+                entity_values[var_info['output']] = value
+
+        if not per_entity:
+            return
+
+        time_cache = self._balance_vars_by_time.setdefault(time_s, {})
+        for entity_key, entity_values in per_entity.items():
+            cached = time_cache.setdefault(entity_key, {})
+            cached.update(entity_values)
+            self._check_balance_identity(
+                check_scope='raw-step',
+                entity_key=entity_key,
+                time_s=time_s,
+                values_by_var=cached,
+            )
+
+        if len(self._balance_vars_by_time) > 5:
+            oldest_time = min(self._balance_vars_by_time.keys())
+            self._balance_vars_by_time.pop(oldest_time, None)
+
+    def _check_bucket_balance(self, completed_records):
+        if not completed_records:
+            return
+
+        per_bucket_entity = {}
+        for rec in completed_records:
+            element_type = rec.get('element_type')
+            if not self._is_household(element_type):
+                continue
+
+            bucket = rec.get('bucket')
+            entity_key = rec.get('element_index') or ''
+            key = (bucket, entity_key)
+            values_by_var = per_bucket_entity.setdefault(key, {})
+            values_by_var[rec.get('variable_name')] = rec.get('value')
+
+        for (bucket, entity_key), values_by_var in per_bucket_entity.items():
+            time_s = (bucket - self.start_date).total_seconds() if bucket is not None else -1
+            self._check_balance_identity(
+                check_scope='bucket-aggregated',
+                entity_key=entity_key,
+                time_s=time_s,
+                values_by_var=values_by_var,
+            )
 
     def create(self, num, model, buff_size=500, attrs=None):
         if num > 1 or self.eid is not None:
@@ -414,6 +568,9 @@ class PostgresWriterModelSimplified(mosaik_api.Simulator):
         
         # Calculate actual simulation time in seconds
         time_s = time * self.time_resolution
+
+        if self.enable_balance_breakpoint:
+            self._check_step_balance(time_s, inputs)
         
         # Process all inputs
         for attr, values in inputs.get(self.eid, {}).items():
@@ -434,6 +591,8 @@ class PostgresWriterModelSimplified(mosaik_api.Simulator):
         # Check for completed buckets and queue them for flush
         completed_records = self.bucket_aggregator.get_completed_buckets()
         if completed_records:
+            if self.enable_balance_breakpoint:
+                self._check_bucket_balance(completed_records)
             self.flush_queue.put(completed_records)
             if self.debug:
                 print(f"[step] t={time}: Queued {len(completed_records)} records from completed bucket(s)")
@@ -479,3 +638,4 @@ class PostgresWriterModelSimplified(mosaik_api.Simulator):
 
 if __name__ == '__main__':
     mosaik_api.start_simulation(PostgresWriterModelSimplified())
+

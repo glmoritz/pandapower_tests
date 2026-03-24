@@ -136,7 +136,7 @@ def save_network_to_database(graph: nx.Graph, net, db_connection, grid_name):
             if old_grid_id is not None:
                 # Step 2: Instead of deleting, we'll just update the grid name to maintain history
                 # This updates the existing grid to have a unique historical name
-                historical_grid_name = f"{grid_name}_history_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
+                historical_grid_name = f"{grid_name}_history_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]}"
                 
                 cur.execute(f"""
                     UPDATE building_power.{grid_catalogue_name}
@@ -218,6 +218,30 @@ def load_network_from_database(db_connection, network_name):
     cur = conn.cursor()
     grid_catalogue_name = 'pandapower_grids'
 
+    def coerce_numeric_strings(obj):
+        if isinstance(obj, dict):
+            return {k: coerce_numeric_strings(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [coerce_numeric_strings(item) for item in obj]
+        if isinstance(obj, str):
+            value = obj.strip()
+            if not value:
+                return obj
+            lower_value = value.lower()
+            if lower_value in {"nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity"}:
+                return obj
+            try:
+                if value.isdigit() or (
+                    len(value) > 1
+                    and value[0] in {"+", "-"}
+                    and value[1:].isdigit()
+                ):
+                    return int(value)
+                return float(value)
+            except ValueError:
+                return obj
+        return obj
+
     # Create a custom JSON decoder for complex objects
     def custom_object_hook(obj):
         if isinstance(obj, dict):
@@ -228,7 +252,9 @@ def load_network_from_database(db_connection, network_name):
             # Handle GeopyPoint objects
             elif "_geopy_point" in obj:
                 point_data = obj["_geopy_point"]
-                return GeopyPoint(point_data["latitude"], point_data["longitude"])
+                latitude = coerce_numeric_strings(point_data["latitude"])
+                longitude = coerce_numeric_strings(point_data["longitude"])
+                return GeopyPoint(latitude, longitude)
             
             # Process nested dictionaries
             return {k: custom_object_hook(v) for k, v in obj.items()}
@@ -267,6 +293,7 @@ def load_network_from_database(db_connection, network_name):
         for bus_index, label, metadata_json in cur.fetchall():
             # Use the custom decoder to parse the JSON
             metadata = custom_object_hook(metadata_json)
+            metadata = coerce_numeric_strings(metadata)
             node_attrs = dict(metadata)
             if label is not None:
                 node_attrs["name"] = label
@@ -282,6 +309,7 @@ def load_network_from_database(db_connection, network_name):
         for source_bus, target_bus, is_directed, metadata_json in cur.fetchall():
             # Use the custom decoder to parse the JSON
             metadata = custom_object_hook(metadata_json)
+            metadata = coerce_numeric_strings(metadata)
             graph.add_edge(source_bus, target_bus, **metadata)
             if not is_directed:
                 graph.add_edge(target_bus, source_bus, **metadata)

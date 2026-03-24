@@ -76,13 +76,57 @@ def distribute_loads_to_buses(net, graph, params, db, rng=None):
             MaxChargePower_kW = (8.0/13.5)*pv_storage_capacity[i]  # 8 kW charge power, 13.5 kWh capacity
             MaxDischargePower_kW = (11.5/13.5)*pv_storage_capacity[i]  # 11.5 kW rated power, 13.5 kWh capacity
 
-            #the maximum power per phase on single/double phase systems will be 10kWp
+            # ---- Determine installation type based on load power ----
+            # The installation type reflects the house wiring (how many grid phases it is connected to).
+            if bus_loads[i] < 3.0:
+                installation_type = '1ph'
+            elif bus_loads[i] < 8.0:
+                installation_type = rng.choice(['1ph', '2ph'])
+            else:
+                installation_type = rng.choice(['2ph', '3ph'])
+
+            # ---- Determine inverter type based on PV peak power, constrained by installation ----
+            # The inverter cannot have more phases than the installation.
+            _phase_count = {'1ph': 1, '2ph': 2, '3ph': 3}
             if pv_peak_power[i] < 10.0:
                 inverter_type = '1ph'
             elif pv_peak_power[i] < 20.0:
                 inverter_type = rng.choice(['1ph', '2ph'])
             else:
                 inverter_type = '3ph'
+
+            # Downgrade inverter type if it exceeds the installation
+            if _phase_count[inverter_type] > _phase_count[installation_type]:
+                inverter_type = installation_type
+
+            # ---- Determine which physical phases the installation connects to ----
+            n_inst = _phase_count[installation_type]
+            installation_connection_phases = rng.choice(['a', 'b', 'c'], size=n_inst, replace=False).tolist()
+
+            # ---- Determine which installation phases the inverter connects to ----
+            n_inv = _phase_count[inverter_type]
+            if n_inv == n_inst:
+                bus_phases = installation_connection_phases[:]
+            else:
+                bus_phases = rng.choice(installation_connection_phases, size=n_inv, replace=False).tolist()
+
+            #TODO: Verificar a Norma copel NTC 901100 para definir os limites dos disjuntores residenciais e comerciais,
+            #  e se possível coletar dados reais de disjuntores usados em residências brasileiras para definir uma distribuição estatística mais realista.
+            #  Por enquanto, estou usando uma distribuição uniforme com um valor padrão baseado em disjuntores típicos, mas isso pode ser melhorado com dados reais.
+
+            # ---- Per-phase breaker limit (kW -> MW) ----
+            # Typical residential breakers: 1ph ~32A@230V=7.36kW, 3ph ~25A@230V=5.75kW per phase.
+            # The parameter 'breaker_limit_per_phase_kW' can be a scalar or a [min, max] range
+            # drawn from the scenario config JSON.  If absent, a default value is derived from
+            # the installation type: roughly 20% headroom above the expected per-phase load.
+            breaker_cfg = params.get('breaker_limit_per_phase_kW', None)
+            if breaker_cfg is None:
+                # Derive a sensible default -- assume breaker rated ~20% above average per-phase load
+                breaker_kw = bus_loads[i] / _phase_count[installation_type] * 1.2
+            elif isinstance(breaker_cfg, list):
+                breaker_kw = rng.uniform(breaker_cfg[0], breaker_cfg[1])
+            else:
+                breaker_kw = float(breaker_cfg)
 
             household_params = {
                 "LoadPower_kW": bus_loads[i],
@@ -92,20 +136,12 @@ def distribute_loads_to_buses(net, graph, params, db, rng=None):
                 "MaxChargePower_MW": MaxChargePower_kW/1000,
                 "MaxDischargePower_MW": MaxDischargePower_kW/1000,
                 "InverterType": inverter_type,
+                "InstallationType": installation_type,
+                "BreakerLimit_MW": breaker_kw / 1000.0,
                 "Index": f'bus{bus}'
             }
             graph.nodes[bus]['household_params'] = household_params
-
-            #connect the household inverter to the bus (in random phases)
-            inverter_phases = ['a', 'b', 'c']
-
-            if inverter_type == '1ph':
-                bus_phases = [rng.choice(['a', 'b', 'c'])]                
-            elif inverter_type == '2ph':
-                bus_phases = rng.choice(['a', 'b', 'c'], size=2, replace=False).tolist()                                                                
-            else:
-                bus_phases = ['a', 'b', 'c']
-
+            graph.nodes[bus]['installation_connection_phases'] = installation_connection_phases
             graph.nodes[bus]['inverter_connection_phases'] = bus_phases
 
             #first I need to find a combination of buses that have this average power
@@ -178,6 +214,164 @@ def distribute_loads_to_buses(net, graph, params, db, rng=None):
             graph.nodes[bus]['household_params']['AssignedLoadPower_kW'] = [row[2] for row in results]  # actual assigned average powers
             graph.nodes[bus]['household_params']['SplitLoads_target_kW'] = split_loads
             
+
+    # --- Phase balancing postprocessing ---
+    if params.get('balance_phase_loading', False):
+        print("[INFO] Running phase balancing postprocessing...")
+        balance_phase_loading(net, graph)
+
+
+def balance_phase_loading(net, graph):
+    """
+    Postprocessing step that rebalances phase assignments for 1ph and 2ph consumers
+    to minimize power imbalance across the three phases (a, b, c) within each
+    transformer branch.
+
+    Only consumers whose InstallationType is '1ph' or '2ph' are eligible for
+    reassignment.  3ph consumers are left untouched because they are inherently
+    balanced.
+
+    Algorithm (per transformer):
+        1. Compute the total load power contributed to each phase by all
+           consumers on the LV side.
+        2. Sort consumers by descending load power (largest first — greedy).
+        3. For each consumer, evaluate every valid phase assignment and pick
+           the one that minimises the resulting max-min phase imbalance.
+        4. Update ``installation_connection_phases`` and
+           ``inverter_connection_phases`` in the graph node accordingly.
+
+    Args:
+        net: pandapower network (for transformer table).
+        graph: NetworkX DiGraph with household_params / phase data on nodes.
+
+    Returns:
+        dict: Per-transformer summary with phase totals before and after
+              balancing and the number of consumers reassigned.
+    """
+    _phase_count = {'1ph': 1, '2ph': 2, '3ph': 3}
+    all_phases = ['a', 'b', 'c']
+    summary = {}
+
+    for idx, trafo_row in net.trafo.iterrows():
+        lv_buses = list(nx.descendants(graph, trafo_row['lv_bus']))
+
+        # Collect buses with household params
+        consumer_buses = []
+        for bus in lv_buses:
+            attrs = graph.nodes.get(bus, {})
+            if 'household_params' not in attrs:
+                continue
+            hp = attrs['household_params']
+            inst_type = hp.get('InstallationType', '3ph')
+            load_kw = hp.get('LoadPower_kW', 0.0)
+            consumer_buses.append({
+                'bus': bus,
+                'installation_type': inst_type,
+                'load_kw': load_kw,
+                'n_inst': _phase_count.get(inst_type, 3),
+            })
+
+        if not consumer_buses:
+            continue
+
+        # --- Compute initial phase totals ---
+        phase_totals_before = {'a': 0.0, 'b': 0.0, 'c': 0.0}
+        for cb in consumer_buses:
+            inst_phases = graph.nodes[cb['bus']].get('installation_connection_phases', all_phases[:])
+            per_phase_kw = cb['load_kw'] / max(len(inst_phases), 1)
+            for ph in inst_phases:
+                phase_totals_before[ph] += per_phase_kw
+
+        # --- Greedy reassignment ---
+        # Reset phase totals — we will rebuild from scratch
+        phase_totals = {'a': 0.0, 'b': 0.0, 'c': 0.0}
+
+        # Separate fixed (3ph) and movable (1ph/2ph) consumers
+        fixed_consumers = [c for c in consumer_buses if c['installation_type'] == '3ph']
+        movable_consumers = [c for c in consumer_buses if c['installation_type'] in ('1ph', '2ph')]
+
+        # Add fixed consumers first
+        for cb in fixed_consumers:
+            inst_phases = graph.nodes[cb['bus']].get('installation_connection_phases', all_phases[:])
+            per_phase_kw = cb['load_kw'] / max(len(inst_phases), 1)
+            for ph in inst_phases:
+                phase_totals[ph] += per_phase_kw
+
+        # Sort movable consumers by load power descending (greedy: place largest first)
+        movable_consumers.sort(key=lambda c: c['load_kw'], reverse=True)
+
+        reassigned_count = 0
+        from itertools import combinations
+        for cb in movable_consumers:
+            n_phases = cb['n_inst']
+
+            # Generate all possible phase assignments for this consumer
+            if n_phases == 1:
+                candidates = [['a'], ['b'], ['c']]
+            elif n_phases == 2:
+                candidates = [list(combo) for combo in combinations(all_phases, 2)]
+            else:
+                candidates = [all_phases[:]]
+
+            best_assignment = None
+            best_imbalance = float('inf')
+
+            for candidate in candidates:
+                # Simulate adding this consumer with this assignment
+                trial = dict(phase_totals)
+                per_phase_kw = cb['load_kw'] / n_phases
+                for ph in candidate:
+                    trial[ph] = trial.get(ph, 0.0) + per_phase_kw
+                imbalance = max(trial.values()) - min(trial.values())
+                if imbalance < best_imbalance:
+                    best_imbalance = imbalance
+                    best_assignment = candidate
+
+            # Apply best assignment
+            per_phase_kw = cb['load_kw'] / n_phases
+            for ph in best_assignment:
+                phase_totals[ph] += per_phase_kw
+
+            # Check if the phases actually changed
+            old_inst_phases = graph.nodes[cb['bus']].get('installation_connection_phases', [])
+            if sorted(best_assignment) != sorted(old_inst_phases):
+                reassigned_count += 1
+
+            # Update graph node
+            graph.nodes[cb['bus']]['installation_connection_phases'] = best_assignment
+
+            # Update inverter connection phases: inverter phases are a subset of
+            # installation phases.  Keep the same count but pick from the new
+            # installation phases.
+            hp = graph.nodes[cb['bus']]['household_params']
+            inv_type = hp.get('InverterType', '1ph')
+            n_inv = _phase_count.get(inv_type, 1)
+            if n_inv >= n_phases:
+                new_inv_phases = best_assignment[:]
+            else:
+                # Pick the first n_inv phases from the new installation phases
+                new_inv_phases = best_assignment[:n_inv]
+            graph.nodes[cb['bus']]['inverter_connection_phases'] = new_inv_phases
+
+        # --- Summary ---
+        imbalance_before = max(phase_totals_before.values()) - min(phase_totals_before.values())
+        imbalance_after = max(phase_totals.values()) - min(phase_totals.values())
+        summary[idx] = {
+            'phase_totals_before_kW': dict(phase_totals_before),
+            'phase_totals_after_kW': dict(phase_totals),
+            'imbalance_before_kW': round(imbalance_before, 4),
+            'imbalance_after_kW': round(imbalance_after, 4),
+            'consumers_total': len(consumer_buses),
+            'consumers_movable': len(movable_consumers),
+            'consumers_reassigned': reassigned_count,
+        }
+
+        print(
+            f"  Trafo {idx}: imbalance {imbalance_before:.2f} kW -> {imbalance_after:.2f} kW "
+            f"({reassigned_count}/{len(movable_consumers)} consumers reassigned)"
+        )
+
+    return summary
 
 
 def apply_profile_to_graph(engine, grid_id: int, profile_name: str, graph: nx.Graph):      
@@ -428,7 +622,7 @@ def save_power_profile_to_database(graph: nx.Graph, net, db_connection, grid_nam
             if old_grid_id is not None:
                 # Step 2: Instead of deleting, we'll just update the grid name to maintain history
                 # This updates the existing grid to have a unique historical name
-                historical_grid_name = f"{grid_name}_history_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}"
+                historical_grid_name = f"{grid_name}_history_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]}"
                 
                 cur.execute(f"""
                     UPDATE building_power.{grid_catalogue_name}
