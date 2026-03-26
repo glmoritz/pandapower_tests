@@ -33,7 +33,8 @@ Parameters are loaded from a JSON configuration file (e.g., `first_test.json`) c
 | Parameter | Type | Description | Example |
 |-----------|------|-------------|---------|
 | `network_id` | string | Identifier for the network configuration | `"first_test_network"` |
-| `use_saved_network_if_exists` | boolean | If true, load existing network from database; if false, generate new network and overwrite existing one | `true` |
+| `require_existing_assets` | boolean | If true, fail if network/profile not in database (use with pre-generated assets) | `true` |
+| `use_saved_network_if_exists` | boolean | **(Deprecated)** Legacy flag, use `require_existing_assets` instead | `true` |
 | `mv_bus_latitude` | float | Latitude coordinate of the medium voltage bus | `-25.4505` |
 | `mv_bus_longitude` | float | Longitude coordinate of the medium voltage bus | `-49.2310` |
 
@@ -60,17 +61,85 @@ These parameters control the random generation of electrical loads and generatio
 | `solar_power_steps` | integer | Number of discrete steps for solar power distribution | `10` |
 | `load_power_range_per_branch_kW` | array[float, float] | [min, max] total electrical load per branch in kW | `[0.5, 100]` |
 | `storage_capacity_range_per_branch_kWh` | array[float, float] | [min, max] total battery storage capacity per branch in kWh | `[0.5, 100]` |
+| `fixed_load_profile_id` | string (optional) | Source profile ID used to preserve the same load/PV assignment across multiple storage runs | `"Solar-20-Seed-1111"` |
+| `preserve_load_when_changing_storage` | boolean (optional) | When true and `fixed_load_profile_id` is set, the simulation reuses the existing load/PV assignment and only updates storage capacities from the specified range. | `true` |
 | `initial_capacity_range` | array[float, float] | [min, max] initial battery state of charge in percent | `[0.0, 100.0]` |
+
+### Phase Balancing
+
+| Parameter | Type | Description | Example |
+|-----------|------|-------------|--------|
+| `balance_phase_loading` | boolean | When `true`, a postprocessing step runs after power profile generation to rebalance phase assignments for 1ph and 2ph consumers, minimising the max-min power imbalance across phases a, b, c within each transformer branch. 3ph consumers are not modified. Default `false`. | `true` |
+
+#### How Phase Balancing Works
+
+During power profile generation, each consumer is randomly assigned to one or more grid phases (a, b, c) depending on its `InstallationType` (1ph, 2ph, or 3ph). This random assignment can lead to significant phase imbalance — for example, most single-phase loads might end up on phase *a*, overloading it while phases *b* and *c* remain underutilised.
+
+When `balance_phase_loading` is enabled, a greedy optimisation runs **after** the initial random assignment:
+
+1. For each transformer, all LV-side consumers are collected.
+2. 3ph consumers (inherently balanced) are fixed in place.
+3. 1ph and 2ph consumers are sorted by descending load power.
+4. Each consumer is reassigned to the phase combination that minimises the resulting max-min imbalance across the three phases.
+5. Both `installation_connection_phases` and `inverter_connection_phases` are updated accordingly.
+
+This produces a more realistic and stable network configuration, reducing the likelihood of convergence errors caused by extreme phase imbalance.
 
 ## Network Generation Behavior
 
-The `use_saved_network_if_exists` parameter controls network loading/generation behavior:
+### Recommended Workflow: Pre-generate Assets
 
-- **`true`**: The simulation attempts to load an existing network with the specified `network_id` from the database. If found, the existing network topology is used. If not found, a new random network is generated and saved to the database.
+For reproducible simulations with consistent network configurations, use the `RegenerateAssets` utility to pre-generate networks and power profiles **before** running simulations:
 
-- **`false`**: The simulation always generates a new random network using the specified parameters and saves it to the database. If a network with the same `network_id` already exists in the database, it will be overwritten.
+```bash
+# Pre-generate networks and power profiles
+python -m simulation_worker.RegenerateAssets --network --profile --folder ./params
 
-This allows for reproducible simulations when using saved networks, or for testing different network configurations when generating new networks.
+# Then run simulations with require_existing_assets=true
+python -m simulation_worker.SimulationWorker --workers 4
+```
+
+Set `require_existing_assets: true` in your parameter files to ensure simulations fail fast if assets are missing.
+
+### Asset Loading Behavior
+
+The `require_existing_assets` parameter controls how the simulation handles missing assets:
+
+| Value | Behavior |
+|-------|----------|
+| `true` | **Strict mode.** Fail with error if network or power profile doesn't exist in database. Recommended when using pre-generated assets. |
+| `false` (default) | **Auto-generate mode.** Try to load from database; if not found, generate new assets and save them. Provides backward compatibility. |
+
+### Legacy Parameters (Deprecated)
+
+The following parameters are deprecated but still supported for backward compatibility:
+
+- `use_saved_network_if_exists` - Ignored when `require_existing_assets` is set
+- `use_saved_power_profile_if_exists` - Ignored when `require_existing_assets` is set
+
+### RegenerateAssets Utility
+
+Use this utility to manually regenerate networks and/or power profiles:
+
+```bash
+# Regenerate both networks and power profiles
+python -m simulation_worker.RegenerateAssets --network --profile
+
+# Regenerate only networks  
+python -m simulation_worker.RegenerateAssets --network
+
+# Regenerate only power profiles (networks must exist)
+python -m simulation_worker.RegenerateAssets --profile
+
+# Specify custom folder
+python -m simulation_worker.RegenerateAssets --folder ./my_params --network
+
+# Parallel processing
+python -m simulation_worker.RegenerateAssets --network --profile --workers 4
+
+# Dry run to preview files
+python -m simulation_worker.RegenerateAssets --network --profile --dry-run
+```
 
 ## Network Generation Process
 

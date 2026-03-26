@@ -19,10 +19,10 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import create_engine, text
 
 
-def distribute_loads_to_buses(net, graph, params, db, rng=None):
+def distribute_loads_to_buses(net, graph, params, db, rng=None, storage_update_only=False):
     """
     Distribute loads, PV systems, and storage to buses in the network.
-    
+
     Args:
         net: Pandapower network
         graph: NetworkX graph representation
@@ -30,11 +30,19 @@ def distribute_loads_to_buses(net, graph, params, db, rng=None):
         db: Database connection parameters
         rng: numpy.random.Generator instance for reproducible randomness.
              If None, creates a new unseeded generator (not recommended).
+        storage_update_only: If True, keeps existing load/PV assignments and only updates storage.
     """
     if rng is None:
         # Fallback for backward compatibility, but not recommended
         rng = np.random.default_rng()
         print("WARNING: distribute_loads_to_buses called without RNG - results will not be reproducible!")
+
+    if storage_update_only:
+        update_storage_capacity(net, graph, params['storage_capacity_range_per_branch_kWh'], rng=rng)
+        if params.get('balance_phase_loading', False):
+            print("[INFO] Running phase balancing postprocessing...")
+            balance_phase_loading(net, graph)
+        return
     
     # Iterate through each transformer in the network
     for idx, trafo_row in net.trafo.iterrows():
@@ -219,6 +227,47 @@ def distribute_loads_to_buses(net, graph, params, db, rng=None):
     if params.get('balance_phase_loading', False):
         print("[INFO] Running phase balancing postprocessing...")
         balance_phase_loading(net, graph)
+
+
+def update_storage_capacity(net, graph, storage_capacity_range_kWh, rng=None):
+    """Update storage capacities on an existing graph while keeping loads and PV fixed.
+
+    Args:
+        net: pandapower network (for transformer branch mapping)
+        graph: networkx graph with existing household_params
+        storage_capacity_range_kWh: scalar or [min,max] range for branch totals
+        rng: numpy RNG (optional)
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    for idx, trafo_row in net.trafo.iterrows():
+        lv_buses = list(nx.descendants(graph, trafo_row['lv_bus']))
+        load_buses = [b for b in lv_buses if 'household_params' in graph.nodes[b]]
+        if not load_buses:
+            continue
+
+        # Determine branch-level storage capacity
+        if isinstance(storage_capacity_range_kWh, (list, tuple)) and len(storage_capacity_range_kWh) == 2:
+            total_storage_capacity_kw = rng.uniform(storage_capacity_range_kWh[0], storage_capacity_range_kWh[1])
+        else:
+            total_storage_capacity_kw = float(storage_capacity_range_kWh)
+
+        # Existing storage distribution as relative shares
+        existing_storages = np.array([graph.nodes[b]['household_params'].get('StorageCapacity_MWh', 0.0) * 1000.0 for b in load_buses])
+        if existing_storages.sum() > 1e-12:
+            ratios = existing_storages / existing_storages.sum()
+        else:
+            ratios = np.ones(len(load_buses), dtype=float) / len(load_buses)
+
+        target_storage_kWh = ratios * total_storage_capacity_kw
+
+        for i, bus in enumerate(load_buses):
+            storage_mwh = target_storage_kWh[i] / 1000.0
+            graph.nodes[bus]['household_params']['StorageCapacity_MWh'] = storage_mwh
+            # Update corresponding rate-limited storage power
+            graph.nodes[bus]['household_params']['MaxChargePower_MW'] = (8.0 / 13.5) * storage_mwh
+            graph.nodes[bus]['household_params']['MaxDischargePower_MW'] = (11.5 / 13.5) * storage_mwh
 
 
 def balance_phase_loading(net, graph):

@@ -95,7 +95,9 @@ def run_simulation(params):
     }    
 
     network_id = f"{params['network_id']}_seed_{str(params['random_seed'])}"
+    base_profile_id = params.get('fixed_load_profile_id', params.get('power_profile_id', 'power_profile'))
     power_profile_id = f"{params['power_profile_id']}_seed_{str(params['random_seed'])}"
+    db_profile_id = f"{base_profile_id}_seed_{str(params['random_seed'])}"
 
     #start mosaik simulation world
     world = mosaik.World(SIM_CONFIG)   
@@ -127,7 +129,7 @@ def run_simulation(params):
     # - require_existing_assets: If True, fail if network/profile doesn't exist (no auto-generation)
     # - use_saved_network_if_exists / use_saved_power_profile_if_exists: Legacy flags (deprecated)
     #   When require_existing_assets is True, these flags are ignored.
-    require_existing_assets = params.get('require_existing_assets', False)
+    require_existing_assets = params.get('require_existing_assets', True)
     
     #Load the simulation network from database or create a new one
     net, graph = None, None
@@ -188,7 +190,7 @@ def run_simulation(params):
     profile_loaded = apply_profile_to_graph(
         engine,
         pandapower_grid_id,
-        power_profile_id,
+        db_profile_id,
         graph
     )        
     if profile_loaded:
@@ -196,7 +198,12 @@ def run_simulation(params):
     else:
         print(f"Power profile '{power_profile_id}' does not exist in database.")
             
-    if not profile_loaded:
+    if profile_loaded and params.get('preserve_load_when_changing_storage', False):
+        print("[INFO] Reusing existing load/PV configuration and updating storage only.")
+        distribute_loads_to_buses(net, graph, params, db, rng=rng_power_profile, storage_update_only=True)
+        save_graph_metadata(engine, pandapower_grid_id, db_profile_id, graph)
+        print(f"Saved updated storage profile '{db_profile_id}' to database.")
+    elif not profile_loaded:
         if require_existing_assets:
             raise ValueError(
                 f"Power profile '{power_profile_id}' not found in database and require_existing_assets=True. "
@@ -205,8 +212,8 @@ def run_simulation(params):
         
         print(f"Generating Power profile '{power_profile_id}'...")
         distribute_loads_to_buses(net, graph, params, db, rng=rng_power_profile)  # Pass independent RNG for power profile
-        save_graph_metadata(engine, pandapower_grid_id, power_profile_id, graph)
-        print(f"Saved power profile '{power_profile_id}' to database.")
+        save_graph_metadata(engine, pandapower_grid_id, db_profile_id, graph)
+        print(f"Saved power profile '{db_profile_id}' to database.")
     
     # Create PV system with certain configuration
     pv_sim = world.start(
