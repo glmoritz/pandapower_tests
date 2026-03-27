@@ -134,7 +134,7 @@ def regenerate_power_profile(params, db, engine, pandapower_grid_id, net, graph,
     return power_profile_id
 
 
-def process_param_file(param_file, regenerate_net=True, regenerate_profile=True):
+def process_param_file(param_file, regenerate_net=True, regenerate_profile=True, params_override=None, entry_index=None):
     """Process a single parameter file, regenerating network and/or power profile.
     
     Args:
@@ -148,16 +148,24 @@ def process_param_file(param_file, regenerate_net=True, regenerate_profile=True)
     from create_random_network import load_network_from_database
     
     start_time = time.time()
+    file_label = os.path.basename(param_file)
+    if entry_index is not None:
+        file_label = f"{file_label}[{entry_index}]"
+
     result = {
-        'file': os.path.basename(param_file),
+        'file': file_label,
+        'source_file': os.path.basename(param_file),
         'started_at': datetime.now().isoformat(),
         'network_regenerated': False,
         'profile_regenerated': False,
     }
     
     try:
-        with open(param_file, 'r') as f:
-            params = json.load(f)
+        if params_override is not None:
+            params = params_override
+        else:
+            with open(param_file, 'r') as f:
+                params = json.load(f)
         
         db = get_db_connection()
         engine = get_db_engine(db)
@@ -215,12 +223,26 @@ def worker_process(work_queue, result_queue, regenerate_net, regenerate_profile,
     """Worker process that pulls files from queue and processes them."""
     while True:
         try:
-            param_file = work_queue.get(timeout=1)
-            if param_file is None:  # Poison pill
+            task = work_queue.get(timeout=1)
+            if task is None:  # Poison pill
                 break
-            
-            print(f"[Worker-{worker_id}] Processing: {os.path.basename(param_file)}")
-            result = process_param_file(param_file, regenerate_net, regenerate_profile)
+
+            if isinstance(task, str):
+                task = {
+                    'param_file': task,
+                    'params': None,
+                    'entry_index': None,
+                    'display_name': os.path.basename(task)
+                }
+
+            print(f"[Worker-{worker_id}] Processing: {task['display_name']}")
+            result = process_param_file(
+                task['param_file'],
+                regenerate_net,
+                regenerate_profile,
+                params_override=task.get('params'),
+                entry_index=task.get('entry_index')
+            )
             result_queue.put(result)
             
         except Exception:
@@ -233,42 +255,112 @@ def read_params_from_file(param_file):
         return json.load(f)
 
 
+def is_valid_param_entry(params):
+    """Check whether a JSON object looks like a runnable simulation param set."""
+    if not isinstance(params, dict):
+        return False
+
+    required_keys = {'network_id', 'power_profile_id', 'random_seed'}
+    return required_keys.issubset(set(params.keys()))
+
+
+def extract_param_entries(param_file):
+    """Return runnable parameter entries from a JSON file.
+
+    Supports both single-dict parameter files and sweep/list files.
+    """
+    raw = read_params_from_file(param_file)
+
+    if isinstance(raw, dict):
+        candidates = [raw]
+    elif isinstance(raw, list):
+        candidates = [entry for entry in raw if isinstance(entry, dict)]
+    else:
+        print(f"[WARNING] Skipping unsupported JSON type in {os.path.basename(param_file)}: {type(raw).__name__}")
+        return []
+
+    entries = []
+    skipped = 0
+    for idx, params in enumerate(candidates):
+        if is_valid_param_entry(params):
+            entries.append({
+                'param_file': param_file,
+                'params': params,
+                'entry_index': idx if isinstance(raw, list) else None,
+                'display_name': f"{os.path.basename(param_file)}[{idx}]" if isinstance(raw, list) else os.path.basename(param_file)
+            })
+        else:
+            skipped += 1
+
+    if skipped > 0:
+        print(
+            f"[INFO] Skipped {skipped} non-parameter entr{'y' if skipped == 1 else 'ies'} "
+            f"in {os.path.basename(param_file)}"
+        )
+
+    return entries
+
+
 def build_unique_files_by_key(param_files, key_builder):
-    """Return one representative file per unique key.
+    """Return one representative parameter entry per unique key.
 
     Args:
         param_files: Iterable of parameter file paths.
         key_builder: Callable that receives loaded params and returns a key.
 
     Returns:
-        tuple: (unique_files, unique_key_count, duplicate_count)
+        tuple: (unique_entries, unique_key_count, duplicate_count)
     """
     unique_by_key = {}
     duplicate_count = 0
+    skipped_files = 0
 
     for param_file in param_files:
-        params = read_params_from_file(param_file)
-        key = key_builder(params)
-        if key in unique_by_key:
-            duplicate_count += 1
+        entries = extract_param_entries(param_file)
+        if not entries:
+            skipped_files += 1
             continue
-        unique_by_key[key] = param_file
 
-    unique_files = list(unique_by_key.values())
-    return unique_files, len(unique_by_key), duplicate_count
+        for entry in entries:
+            params = entry['params']
+            key = key_builder(params)
+            if key in unique_by_key:
+                duplicate_count += 1
+                continue
+            unique_by_key[key] = entry
+
+    if skipped_files > 0:
+        print(f"[INFO] Skipped {skipped_files} JSON file(s) with no runnable parameter entries.")
+
+    unique_entries = list(unique_by_key.values())
+    return unique_entries, len(unique_by_key), duplicate_count
 
 
 def execute_file_batch(param_files, regenerate_net, regenerate_profile, num_workers):
-    """Execute regeneration for a batch of files (sequential or parallel)."""
+    """Execute regeneration for a batch of parameter entries (sequential or parallel)."""
     results = []
 
     if not param_files:
         return results
 
     if num_workers <= 1:
-        for i, param_file in enumerate(param_files, 1):
-            print(f"[{i}/{len(param_files)}] Processing: {os.path.basename(param_file)}")
-            result = process_param_file(param_file, regenerate_net, regenerate_profile)
+        for i, task in enumerate(param_files, 1):
+            if isinstance(task, str):
+                task = {
+                    'param_file': task,
+                    'params': None,
+                    'entry_index': None,
+                    'display_name': os.path.basename(task)
+                }
+
+            print(f"[{i}/{len(param_files)}] Processing: {task['display_name']}")
+            result = process_param_file(
+                task['param_file'],
+                regenerate_net,
+                regenerate_profile,
+                params_override=task.get('params'),
+                entry_index=task.get('entry_index')
+            )
             results.append(result)
             print(f"  -> {result['status']} ({result['duration_s']}s)")
         return results
